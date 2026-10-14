@@ -1,0 +1,25 @@
+{
+  "port": 8800,
+  "dads": [
+    {
+      "name": "hr",
+      "title": "Sample HR application",
+      "description": "Departments and employees: list, edit, save, delete; document upload and download; CSV export.",
+      "db": ":memory:",
+      "install": ["hr/install.sql"],
+      "default_page": "hr_web.home",
+      "document_table": "hr_docs",
+      "document_path": "docs",
+      "document_procedure": "hr_web.download",
+      "max_upload": 5242880
+    },
+    {
+      "name": "appdoc",
+      "title": "AppDoc",
+      "description": "Technical documentation and help, kept by application. Starts with the Northwind Traders forms.",
+      "db": ":memory:",
+      "install": ["appdoc/install.sql", "appdoc/northwind-harvest.sql", "appdoc/northwind-docs.sql"],
+      "default_page": "appdoc.home"
+    }
+  ]
+}

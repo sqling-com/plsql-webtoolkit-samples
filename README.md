@@ -3,7 +3,7 @@
 Two applications written the way mod_plsql applications are: PL/SQL packages that write
 their pages with `HTP`, forms that post back to a procedure, and a redirect after a save.
 Both run on Oracle's PL/SQL gateway (mod_plsql, or ORDS in PL/SQL gateway mode) and,
-unchanged, on [sqling](https://sqling.com)'s gateway, where they are live demos.
+unchanged, on [sqling](https://sqling.com)'s gateway over SQLite, where they are live demos.
 
 | Sample | What it is | Live demo |
 |---|---|---|
@@ -12,9 +12,30 @@ unchanged, on [sqling](https://sqling.com)'s gateway, where they are live demos.
 
 The demos are part of sqling Pro (sign-in required).
 
+## Running on SQLite with sqling's gateway
+
+The live demos do not use Oracle. sqling's PL/SQL gateway runs the same packages on
+**SQLite**: the sqling Engine executes the PL/SQL, `HTP`, `OWA_UTIL`, `HTF` and
+`WPG_DOCLOAD` included, and the SQL runs on SQLite. [`owart.json`](owart.json) is the
+gateway's DAD configuration for both samples, the same settings the demos run with:
+
+| Setting | Meaning |
+|---|---|
+| `name` | the DAD: pages are served at `/<name>/<procedure>` |
+| `db` | the database: `:memory:` (a fresh SQLite database, built from `install` at every start), a `.sqlite` file, or a saved database bundle (`.zip`) |
+| `install` | scripts run in order when the DAD starts, paths relative to `owart.json` |
+| `default_page` | the procedure `/<name>/` opens |
+| `document_table`, `document_path`, `document_procedure` | mod_plsql's document settings: where uploads go and how `/<name>/docs/...` downloads are served |
+| `max_upload` | the largest request body, in bytes |
+
+With `:memory:` the data starts fresh every time, as the demos do. To keep it, point `db` at a
+`.sqlite` file and load the install scripts once, not on every start.
+
+The gateway is part of sqling Pro and is not in this repository.
+
 ## HR
 
-Load `hr/install.sql` into a schema and give its DAD `hr_web.home` as the default page.
+On Oracle, load `hr/install.sql` into a schema and give its DAD `hr_web.home` as the default page.
 Uploads and downloads go through a mod_plsql document table, `HR_DOCS` (document path
 `docs`, document procedure `hr_web.download`), which the DAD's administrator creates:
 
@@ -60,8 +81,8 @@ application is **Northwind Traders**, seven Oracle Forms modules:
 
 ### Running it
 
-Load the three scripts in that order into a schema, then point a PL/SQL gateway DAD at it
-with `appdoc.home` as the default page:
+On Oracle, load the three scripts in that order into a schema, then point a PL/SQL gateway DAD
+at it with `appdoc.home` as the default page:
 
 ```sql
 @appdoc/install.sql
