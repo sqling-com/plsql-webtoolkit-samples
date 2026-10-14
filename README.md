@@ -69,8 +69,10 @@ with `appdoc.home` as the default page:
 @appdoc/northwind-docs.sql
 ```
 
-Both samples compile on Oracle Database 23ai, and AppDoc's pages run there under its PL/SQL
-Web Toolkit. On an earlier release, drop the `IF NOT EXISTS` from the `CREATE TABLE` statements.
+Both samples compile and run on Oracle Database 23ai under its PL/SQL Web Toolkit: every
+page, including saves, deletes, AppDoc's export and HR's CSV export. HR's download hands the
+document to the gateway through `wpg_docload`, as mod_plsql and ORDS expect. On an earlier
+release, drop the `IF NOT EXISTS` from the `CREATE TABLE` statements.
 
 ## License
 
