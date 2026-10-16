@@ -74,6 +74,30 @@ CREATE TABLE IF NOT EXISTS screen_crud (
   PRIMARY KEY (screen_id, table_name)
 );
 
+-- Help macros: one help text for every screen that shows it. {{name}} or {{name:argument}}
+-- reads as the macro's Forms text or web text, with $1 the argument; an application's own
+-- macro wins over the one for every application (app_id NULL). {{forms:...|web:...}} says it
+-- inline. AppDoc's help reads the Forms wording unless asked for the web's (p_ui=web), which
+-- is how App Builder's pages ask.
+CREATE TABLE IF NOT EXISTS doc_macro (
+  app_id      VARCHAR2(15),
+  macro_name  VARCHAR2(30) NOT NULL,
+  forms_text  VARCHAR2(2000),
+  web_text    VARCHAR2(2000)
+);
+
+INSERT INTO doc_macro (app_id, macro_name, forms_text, web_text)
+SELECT NULL, 'find', 'press <b>Enter Query</b>, type $1, then <b>Execute Query</b>',
+       'type $1 in <b>Find</b> and press <b>Find</b>'
+  FROM dual WHERE NOT EXISTS (SELECT 1 FROM doc_macro WHERE app_id IS NULL AND macro_name = 'find');
+INSERT INTO doc_macro (app_id, macro_name, forms_text, web_text)
+SELECT NULL, 'lov', 'the <b>...</b> button (or the List of Values key)', 'the <b>...</b> button (or F9)'
+  FROM dual WHERE NOT EXISTS (SELECT 1 FROM doc_macro WHERE app_id IS NULL AND macro_name = 'lov');
+INSERT INTO doc_macro (app_id, macro_name, forms_text, web_text)
+SELECT NULL, 'help-key', 'the Help key', 'F1 (or <b>Help</b> at the top)'
+  FROM dual WHERE NOT EXISTS (SELECT 1 FROM doc_macro WHERE app_id IS NULL AND macro_name = 'help-key');
+COMMIT;
+
 CREATE SEQUENCE screen_seq START WITH 10000;
 
 CREATE OR REPLACE PACKAGE appdoc AS
@@ -106,7 +130,12 @@ CREATE OR REPLACE PACKAGE appdoc AS
                       p_u IN owa.vc_arr DEFAULT appdoc.empty, p_d IN owa.vc_arr DEFAULT appdoc.empty,
                       p_new_table IN VARCHAR2 DEFAULT NULL);
   PROCEDURE reference(p_app_id IN VARCHAR2 DEFAULT NULL, p_screen_id IN NUMBER DEFAULT NULL);
-  PROCEDURE help(p_app_id IN VARCHAR2 DEFAULT NULL, p_screen_code IN VARCHAR2 DEFAULT NULL);
+  PROCEDURE help(p_app_id IN VARCHAR2 DEFAULT NULL, p_screen_code IN VARCHAR2 DEFAULT NULL, p_ui IN VARCHAR2 DEFAULT 'forms');
+  -- Help text with its macros read for a kind of screen: 'forms' or 'web'.
+  FUNCTION expand(p_text IN VARCHAR2, p_app_id IN VARCHAR2, p_ui IN VARCHAR2 DEFAULT 'forms') RETURN VARCHAR2;
+  PROCEDURE macro_save(p_app_id IN VARCHAR2, p_macro_name IN VARCHAR2, p_forms_text IN VARCHAR2 DEFAULT NULL,
+                       p_web_text IN VARCHAR2 DEFAULT NULL);
+  PROCEDURE macro_delete(p_app_id IN VARCHAR2, p_macro_name IN VARCHAR2);
   PROCEDURE export(p_app_id IN VARCHAR2);
 END appdoc;
 /
@@ -281,6 +310,65 @@ input.short { max-width: 200px; } input.tiny { max-width: 110px; }
     RETURN CASE WHEN upper(v) IN ('Y', 'YES', 'ON', 'TRUE') THEN 'Y' END;
   END;
 
+  -- MACROS ---------------------------------------------------------------------------------
+  FUNCTION expand(p_text IN VARCHAR2, p_app_id IN VARCHAR2, p_ui IN VARCHAR2 DEFAULT 'forms') RETURN VARCHAR2 IS
+    t VARCHAR2(32767) := p_text; out VARCHAR2(32767); pos PLS_INTEGER := 1; s PLS_INTEGER; e PLS_INTEGER;
+    body VARCHAR2(4000); part VARCHAR2(4000); rest VARCHAR2(4000); name VARCHAR2(100); arg VARCHAR2(4000);
+    rep VARCHAR2(4000); ui VARCHAR2(10) := lower(coalesce(p_ui, 'forms')); found BOOLEAN; bar PLS_INTEGER;
+  BEGIN
+    IF t IS NULL OR instr(t, '{{') = 0 THEN RETURN t; END IF;
+    LOOP
+      s := instr(t, '{{', pos);
+      EXIT WHEN s = 0;
+      e := instr(t, '}}', s + 2);
+      EXIT WHEN e = 0;
+      body := substr(t, s + 2, e - s - 2);
+      IF regexp_like(body, '^(forms|web):') THEN
+        -- {{forms:...|web:...}}: the part for this screen, nothing if it has none
+        rep := NULL; rest := body;
+        LOOP
+          bar := instr(rest, '|');
+          part := CASE WHEN bar > 0 THEN substr(rest, 1, bar - 1) ELSE rest END;
+          IF lower(part) LIKE ui || ':%' THEN rep := substr(part, length(ui) + 2); END IF;
+          EXIT WHEN bar = 0;
+          rest := substr(rest, bar + 1);
+        END LOOP;
+      ELSE
+        name := lower(trim(CASE WHEN instr(body, ':') > 0 THEN substr(body, 1, instr(body, ':') - 1) ELSE body END));
+        arg := CASE WHEN instr(body, ':') > 0 THEN substr(body, instr(body, ':') + 1) END;
+        found := FALSE;
+        FOR m IN (SELECT forms_text, web_text FROM doc_macro
+                   WHERE macro_name = name AND (app_id = upper(p_app_id) OR app_id IS NULL)
+                   ORDER BY CASE WHEN app_id IS NULL THEN 1 ELSE 0 END) LOOP
+          rep := replace(CASE WHEN ui = 'web' THEN coalesce(m.web_text, m.forms_text) ELSE m.forms_text END, '$1', arg);
+          found := TRUE;
+          EXIT;
+        END LOOP;
+        IF NOT found THEN rep := '{{' || body || '}}'; END IF;      -- unknown: left for its author to see
+      END IF;
+      out := out || substr(t, pos, s - pos) || rep;
+      pos := e + 2;
+    END LOOP;
+    RETURN out || substr(t, pos);
+  END;
+
+  PROCEDURE macro_save(p_app_id IN VARCHAR2, p_macro_name IN VARCHAR2, p_forms_text IN VARCHAR2 DEFAULT NULL,
+                       p_web_text IN VARCHAR2 DEFAULT NULL) IS
+  BEGIN
+    DELETE FROM doc_macro WHERE app_id = upper(p_app_id) AND macro_name = lower(trim(p_macro_name));
+    INSERT INTO doc_macro (app_id, macro_name, forms_text, web_text)
+    VALUES (upper(p_app_id), lower(trim(p_macro_name)), p_forms_text, p_web_text);
+    COMMIT;
+    owa_util.redirect_url('appdoc.app?p_app_id=' || u(p_app_id) || '#macros');
+  END;
+
+  PROCEDURE macro_delete(p_app_id IN VARCHAR2, p_macro_name IN VARCHAR2) IS
+  BEGIN
+    DELETE FROM doc_macro WHERE app_id = upper(p_app_id) AND macro_name = lower(p_macro_name);
+    COMMIT;
+    owa_util.redirect_url('appdoc.app?p_app_id=' || u(p_app_id) || '#macros');
+  END;
+
   -- HOME -----------------------------------------------------------------------------------
   PROCEDURE home IS
     n NUMBER := 0;
@@ -349,6 +437,28 @@ input.short { max-width: 200px; } input.tiny { max-width: 110px; }
     IF open_t THEN htp.print('</tbody></table></div>'); ELSE htp.print('<p class="empty">No screens yet.</p>'); END IF;
     htp.print('</section>');
 
+    -- the help macros this application's text can use
+    htp.print('<section class="card" id="macros"><header><h2>Help macros</h2><span class="right">'
+              || 'In help and descriptions: <span class="code">{{name}}</span> or <span class="code">{{name:argument}}</span> '
+              || '($1 in the text), or <span class="code">{{forms:...|web:...}}</span></span></header>'
+              || '<div class="scroll"><table><thead><tr><th>Macro</th><th>Oracle Forms</th><th>Web (App Builder)</th><th></th></tr></thead><tbody>');
+    FOR m IN (SELECT app_id, macro_name, forms_text, web_text FROM doc_macro
+               WHERE app_id = r.app_id OR (app_id IS NULL AND NOT EXISTS
+                     (SELECT 1 FROM doc_macro o WHERE o.app_id = r.app_id AND o.macro_name = doc_macro.macro_name))
+               ORDER BY macro_name) LOOP
+      htp.print('<tr><td class="mono">{{' || esc(m.macro_name) || '}}</td><td>' || esc(m.forms_text) || '</td><td>' || esc(m.web_text)
+                || '</td><td>' || CASE WHEN m.app_id IS NULL THEN chip('every application')
+                ELSE '<form method="post" action="appdoc.macro_delete" style="display:inline"><input type="hidden" name="p_app_id" value="'
+                     || esc(r.app_id) || '"><input type="hidden" name="p_macro_name" value="' || esc(m.macro_name)
+                     || '"><button class="btn small danger" type="submit">Delete</button></form>' END || '</td></tr>');
+    END LOOP;
+    htp.print('</tbody></table></div><form class="grid" method="post" action="appdoc.macro_save" style="margin-top:14px">'
+              || '<input type="hidden" name="p_app_id" value="' || esc(r.app_id) || '">');
+    field('Macro', 'p_macro_name', NULL, 'short', 'A new name, or one above to replace it for this application.', TRUE);
+    field('Oracle Forms text', 'p_forms_text', NULL);
+    field('Web text', 'p_web_text', NULL);
+    htp.print('<div class="actions"><button class="btn" type="submit">Save macro</button></div></form></section>');
+
     htp.print('<section class="card"><header><h2>Application</h2><span class="code">' || esc(r.app_id) || '</span></header>'
               || '<form class="grid" method="post" action="appdoc.app_save"><input type="hidden" name="p_app_id" value="' || esc(r.app_id) || '">');
     field('Name', 'p_app_name', r.app_name, NULL, NULL, TRUE);
@@ -414,7 +524,8 @@ input.short { max-width: 200px; } input.tiny { max-width: 110px; }
     field('Source file', 'p_source_filename', s.source_filename, 'short');
     field('Main table', 'p_master_table_name', s.master_table_name, 'short');
     area('Description', 'p_screen_description', s.screen_description, 'For the technical reference. HTML is allowed.', 5);
-    area('Help', 'p_screen_help', s.screen_help, 'What a user of the screen reads. HTML is allowed.', 10);
+    area('Help', 'p_screen_help', s.screen_help, 'What a user of the screen reads. HTML is allowed, and the application''s '
+         || '<a href="appdoc.app?p_app_id=' || u(s.app_id) || '#macros">help macros</a>: one text for Oracle Forms and the web.', 10);
     area('Team notes', 'p_screen_user_notes', s.screen_user_notes, 'Internal; not published.', 3);
     htp.print('<div class="actions"><button class="btn primary" type="submit">Save</button></div></form>');
     IF p_screen_id IS NOT NULL THEN
@@ -671,7 +782,7 @@ window.addEventListener("beforeprint", function () { document.querySelectorAll("
       IF a.image_file_prefix IS NOT NULL AND s.image_filename IS NOT NULL THEN
         htp.print('<img class="shot" alt="' || esc(s.screen_title) || '" src="' || a.image_file_prefix || s.image_filename || '">');
       END IF;
-      IF s.screen_description IS NOT NULL THEN htp.print('<p class="desc">' || s.screen_description || '</p>'); END IF;
+      IF s.screen_description IS NOT NULL THEN htp.print('<p class="desc">' || expand(s.screen_description, s.app_id) || '</p>'); END IF;
       n := 0;
       FOR c IN (SELECT * FROM screen_crud WHERE screen_id = s.screen_id ORDER BY table_name) LOOP
         n := n + 1;
@@ -700,12 +811,12 @@ window.addEventListener("beforeprint", function () { document.querySelectorAll("
                   || CASE WHEN i.item_default IS NOT NULL THEN chip('Default ' || esc(i.item_default)) END
                   || CASE WHEN i.item_low_value IS NOT NULL THEN chip('&ge; ' || esc(i.item_low_value)) END
                   || CASE WHEN i.item_high_value IS NOT NULL THEN chip('&le; ' || esc(i.item_high_value)) END
-                  || '</td><td>' || i.item_description || '</td><td class="mono">'
+                  || '</td><td>' || expand(i.item_description, s.app_id) || '</td><td class="mono">'
                   || brk(esc(i.item_table_name || CASE WHEN i.item_column_name IS NOT NULL THEN '.' || i.item_column_name END)) || '</td></tr>');
       END LOOP;
       IF n > 0 THEN htp.print('</tbody></table></div>'); END IF;
       IF s.screen_help IS NOT NULL THEN
-        htp.print('<details><summary>Help text</summary><div class="help">' || s.screen_help || '</div></details>');
+        htp.print('<details><summary>Help text</summary><div class="help">' || expand(s.screen_help, s.app_id) || '</div></details>');
       END IF;
       htp.print('</section>');
     END LOOP;
@@ -716,7 +827,7 @@ window.addEventListener("beforeprint", function () { document.querySelectorAll("
   END;
 
   -- HELP -----------------------------------------------------------------------------------
-  PROCEDURE help(p_app_id IN VARCHAR2 DEFAULT NULL, p_screen_code IN VARCHAR2 DEFAULT NULL) IS
+  PROCEDURE help(p_app_id IN VARCHAR2 DEFAULT NULL, p_screen_code IN VARCHAR2 DEFAULT NULL, p_ui IN VARCHAR2 DEFAULT 'forms') IS
     a     app_row%ROWTYPE;
     cnt   NUMBER;
     title VARCHAR2(200);
@@ -749,7 +860,7 @@ window.addEventListener("beforeprint", function () { document.querySelectorAll("
       IF cnt > 1 THEN
         htp.print('<header><h2>' || esc(s.screen_title) || '</h2><span class="code">' || esc(s.screen_code) || '</span></header>');
       END IF;
-      htp.print('<div class="help">' || coalesce(s.screen_help, s.screen_description,
+      htp.print('<div class="help">' || coalesce(expand(s.screen_help, a.app_id, p_ui), expand(s.screen_description, a.app_id, p_ui),
                 '<p class="empty">There is no help for this screen yet.</p>') || '</div>');
       IF cnt = 1 THEN
         htp.print('<div class="actions"><button class="btn primary" type="button" onclick="window.close()">Close</button></div>');

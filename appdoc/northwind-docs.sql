@@ -1,5 +1,8 @@
 -- AppDoc: the written half of the Northwind documentation.
 --
+-- One text for the Forms modules and for App Builder's web pages: where they differ, a help
+-- macro says both -- {{find:...}}, {{lov}}, {{forms:...|web:...}} (see doc_macro).
+--
 -- The harvest (owart.harvest --forms) records what the seven Northwind modules say about
 -- themselves -- screens, items, types, rules, tables.  This adds what a person writes:
 -- the application's description, each form's description and help, and each field's
@@ -31,8 +34,8 @@ UPDATE screen SET
   screen_description = 'Maintains CUSTOMERS. A second, read-only block lists the customer''s orders, newest first, '
     || 'from ORDERS (joined on CUSTOMERID).',
   screen_help = '<p>Look up, add, change or remove a customer.</p>'
-    || '<ul><li><b>Find a customer</b>: press <b>Enter Query</b>, type part of any field (for example the company name), '
-    || 'then <b>Execute Query</b>. Use the arrow keys or scroll to move between the customers found.</li>'
+    || '<ul><li><b>Find a customer</b>: {{find:part of any field (for example the company name)}}.'
+    || ' Use the arrow keys or scroll to move between the customers found.</li>'
     || '<li><b>Add a customer</b>: press <b>New</b>, type a five-letter <b>Customer ID</b> and the company details, then <b>Save</b>.</li>'
     || '<li><b>Change</b> any field and press <b>Save</b>. <b>Delete</b> removes the current customer.</li></ul>'
     || '<p>The <b>Orders for this customer</b> list underneath is for reference: it shows the customer''s orders, newest first, '
@@ -43,11 +46,12 @@ UPDATE screen SET
   screen_description = 'Maintains ORDERS and their lines in "Order Details" (master-detail on ORDERID). Customers, employees '
     || 'and products are chosen from lists of values; shippers from a list. The order total and each line total are calculated.',
   screen_help = '<p>Enter and maintain customer orders and the products on them.</p>'
-    || '<ul><li><b>Find an order</b>: press <b>Enter Query</b>, type an order ID, a customer ID or a date, then <b>Execute Query</b>.</li>'
+    || '<ul><li><b>Find an order</b>: {{find:an order ID, a customer ID or a date}}.</li>'
     || '<li><b>New order</b>: press <b>New</b>. The order ID is assigned when you save. Choose the <b>Customer</b> and <b>Employee</b> '
-    || 'with the <b>...</b> buttons, pick a shipper in <b>Ship Via</b>, and fill in the dates and shipping address.</li>'
-    || '<li><b>Lines</b>: press <b>New line</b>, then <b>Pick product...</b> to choose a product; its unit price is filled in for you. '
-    || 'Enter the quantity and any discount (0.15 is 15%). <b>Delete line</b> removes the current line.</li>'
+    || 'with {{lov}}, pick a shipper in <b>Ship Via</b>, and fill in the dates and shipping address.</li>'
+    || '<li><b>Lines</b>: {{forms:press <b>New line</b>, then <b>Pick product...</b> to choose a product|web:press <b>Add line</b> and choose the product in the new row}}; '
+    || 'its unit price is filled in for you. Enter the quantity and any discount (0.15 is 15%). '
+    || '{{forms:<b>Delete line</b> removes the current line.|web:Tick a line&rsquo;s delete box (&#10005;) to remove it when you save.}}</li>'
     || '<li>Press <b>Save</b> to save the order and all its lines together.</li></ul>'
     || '<p><b>Order Total</b> adds up the lines (price &times; quantity, less discount); <b>Line Total</b> shows one line.</p>'
 WHERE app_id = 'NW' AND screen_code = 'NW_ORDERS';
@@ -56,7 +60,7 @@ UPDATE screen SET
   screen_description = 'Maintains PRODUCTS. The supplier is chosen from a list of values over SUPPLIERS and the category '
     || 'from a list of the CATEGORIES.',
   screen_help = '<p>Maintain the products Northwind sells.</p>'
-    || '<ul><li><b>Find a product</b>: <b>Enter Query</b>, type part of the name (or a category or supplier), <b>Execute Query</b>.</li>'
+    || '<ul><li><b>Find a product</b>: {{find:part of the name (or a category or supplier)}}.</li>'
     || '<li><b>New product</b>: press <b>New</b>, give it a name, choose its <b>Supplier</b> with the <b>...</b> button and its '
     || '<b>Category</b> from the list, then the price and stock figures, and <b>Save</b>. The product ID is assigned on save.</li>'
     || '<li>Tick <b>Discontinued</b> for a product that is no longer sold; it stays on old orders.</li></ul>'
@@ -67,8 +71,8 @@ UPDATE screen SET
   screen_description = 'Maintains SUPPLIERS. A second, read-only block lists the supplier''s products from PRODUCTS '
     || '(joined on SUPPLIERID).',
   screen_help = '<p>Maintain the companies that supply Northwind''s products.</p>'
-    || '<ul><li><b>Find a supplier</b>: <b>Enter Query</b>, type part of the company name, country or any other field, '
-    || '<b>Execute Query</b>.</li>'
+    || '<ul><li><b>Find a supplier</b>: {{find:part of the company name, country or any other field}}.'
+    || '</li>'
     || '<li><b>New supplier</b>: press <b>New</b>, fill in the company name and contact details, <b>Save</b>. '
     || 'The supplier ID is assigned on save.</li></ul>'
     || '<p>The <b>Products from this supplier</b> list is for reference. Use the Products form to change a product.</p>'
@@ -78,7 +82,7 @@ UPDATE screen SET
   screen_description = 'Maintains EMPLOYEES on three tab pages (Personal, Address, Notes). Reports To is chosen from a '
     || 'list of values over EMPLOYEES and shown by name.',
   screen_help = '<p>Maintain Northwind''s staff.</p>'
-    || '<ul><li><b>Find an employee</b>: <b>Enter Query</b>, type part of the last name or any other field, <b>Execute Query</b>.</li>'
+    || '<ul><li><b>Find an employee</b>: {{find:part of the last name or any other field}}.</li>'
     || '<li><b>New employee</b>: press <b>New</b>, enter at least the first and last name, and <b>Save</b>. '
     || 'The employee ID is assigned on save.</li>'
     || '<li>The fields are on three tabs: <b>Personal</b> (name, title, dates, manager), <b>Address</b> (address and phone) '
@@ -93,7 +97,7 @@ UPDATE screen SET
     || '<ul><li><b>Categories</b> &ndash; the product categories offered on the Products form.</li>'
     || '<li><b>Shippers</b> &ndash; the shipping companies offered in Ship Via on the Orders form.</li>'
     || '<li><b>Regions</b> and <b>Territories</b> &ndash; sales regions, and the territories within each.</li></ul>'
-    || '<p>Press <b>New</b> to add a row to the current tab, change any cell in place, and press <b>Save</b>. '
+    || '<p>{{forms:Press <b>New</b> to add a row to the current tab|web:Press <b>Add row</b> on the current tab to add a row}}, change any cell in place, and press <b>Save</b>. '
     || 'Ids are assigned on save, except a territory&rsquo;s, which you type.</p>'
 WHERE app_id = 'NW' AND screen_code = 'NW_LOOKUPS';
 
@@ -177,7 +181,7 @@ BEGIN
   nw_doc('NW_ORDERS', 'ORDERS.SHIPNAME', 'Name to ship the order to.');
   nw_doc('NW_ORDERS', 'ORDERS.ORDER_TOTAL', 'The value of the order: each line''s unit price times quantity, less its discount, added up. Calculated when the order is fetched.');
   nw_doc('NW_ORDERS', 'ORDER_DETAILS.ORDERID', 'Links each line to the order above; filled in automatically and not shown.');
-  nw_doc('NW_ORDERS', 'ORDER_DETAILS.PRODUCTID', 'The product on this line, chosen with Pick product...; choosing one also fills in its unit price.');
+  nw_doc('NW_ORDERS', 'ORDER_DETAILS.PRODUCTID', 'The product on this line, chosen {{forms:with Pick product...|web:in the Product column}}; choosing one also fills in its unit price.');
   nw_doc('NW_ORDERS', 'ORDER_DETAILS.PRODUCT_NAME', 'The chosen product''s name, shown for reference.');
   nw_doc('NW_ORDERS', 'ORDER_DETAILS.UNITPRICE', 'Price of one unit on this order; taken from the product, and can be changed.');
   nw_doc('NW_ORDERS', 'ORDER_DETAILS.QUANTITY', 'How many units are ordered (1 for a new line).');
