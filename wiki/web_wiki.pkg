@@ -1,0 +1,2405 @@
+set define off
+------------------------------------------------------------------------------
+-- web_wiki - wiki engine in PL/SQL with a WYSIWYG editor and form support.
+-- Written by Dan Bailey (2007); rewritten October 2026.
+--
+-- Requires: schema from web_wiki.ddl, Oracle 12.2+ (or the SQLing Engine), a
+--           PL/SQL gateway (ORDS, mod_plsql or owart), and wiki_env.sql: who is
+--           signed in, security levels, names and mail, supplied by the
+--           application around the wiki.
+--
+-- Gateway allow-list (ORDS: ords_admin / PlsqlRequestValidationFunction): expose only
+--   web_wiki.show_wiki, show_wiki_data, saveformdata, delete_wiki, rename_wiki,
+--   purge_wiki, email_form, email_wiki, wiki_js  (wiki_env.allowed does it here)
+-- set_batch_user refuses to run inside a web request, but it should not be listed either.
+------------------------------------------------------------------------------
+create or replace package web_wiki is
+
+  empty_vc_arr owa.vc_arr;
+
+  -- Main entry point.  <gateway path>/web_wiki.show_wiki?p_topic=Home
+  procedure show_wiki
+    (p_action        in varchar2   default null   -- browse | edit | list | log | search | refs
+    ,p_id            in varchar2   default null   -- revision id
+    ,p_topic         in varchar2   default null   -- document name (or search text for search)
+    ,p_dir           in varchar2   default null   -- list: a|d sort direction; edit: Save | Save As
+    ,p_data          in owa.vc_arr default empty_vc_arr   -- edited page, in chunks
+    ,p_ownerlock     in varchar2   default null   -- Y = only the owner may edit
+    ,p_datasetid     in varchar2   default null   -- saved form record to load into the page
+    ,p_excludesearch in varchar2   default null   -- Y = hide from other people's searches
+    ,p_topic_new     in varchar2   default null   -- Save As name
+    ,p_lite          in varchar2   default null   -- Y = minimal heading
+    ,p_extralite     in varchar2   default null   -- Y = page content and scripts only
+    ,p_arg           in varchar2   default null   -- exposed to page scripts as p_arg
+    ,p_base_id       in varchar2   default null   -- revision the editor started from (conflict check)
+    ,p_force         in varchar2   default null   -- Y = save even though someone saved meanwhile
+    );
+
+  -- Target of page forms (named "userform"). Called as <gateway path>/!web_wiki.saveformdata
+  procedure saveformdata
+    (name_array  in owa.vc_arr default empty_vc_arr
+    ,value_array in owa.vc_arr default empty_vc_arr);
+
+  -- List of saved form records for a document (p_topic) or one revision (p_id)
+  procedure show_wiki_data
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null);
+
+  -- Soft delete one revision (p_id) or a whole document (p_topic). POST only.
+  procedure delete_wiki
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null);
+
+  -- Permanently remove soft-deleted revisions (admins). POST only.
+  procedure purge_wiki
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null);
+
+  -- Rename a document and fix [[links]] to it. POST only.
+  procedure rename_wiki
+    (p_topic_old in varchar2 default null
+    ,p_topic_new in varchar2 default null);
+
+  -- Email popup form, and the send action (POST only).
+  procedure email_form
+    (p_topic in varchar2 default null);
+
+  procedure email_wiki
+    (p_emailfrom    in varchar2   default null    -- ignored: the sender is always the signed-in user
+    ,p_emailto      in varchar2   default null
+    ,p_emailsubject in varchar2   default null
+    ,p_topic        in varchar2   default null
+    ,p_private      in varchar2   default null    -- reserved
+    ,p_emailbody    in owa.vc_arr default empty_vc_arr);  -- ignored: the page is read from the database
+
+  -- Editor / page script (static, cacheable).
+  procedure wiki_js
+    (v in varchar2 default null);
+
+  -- For PL/SQL batch jobs that call saveformdata etc. outside a web request.
+  -- Raises an error if called through the web gateway.
+  procedure set_batch_user
+    (p_user     in varchar2
+    ,p_seclevel in number default 5);
+
+end web_wiki;
+/
+show errors
+
+create or replace package body web_wiki is
+------------------------------------------------------------------------------
+-- Storage
+--   DDG_WIKI       one row per saved revision; the highest ID per TOPIC is current.
+--   DDG_WIKI_DATA  form records ("datasets"), one row per field value chunk.
+--                  Records belong to the document (topic), whichever revision saved them.
+--
+-- Markup inside pages
+--   [[Topic]]  [[Topic|label]]                  wiki links
+--   {script ...} {/script} {style ...} {/style}  become real tags when displayed
+--   {br} {underscore} [USERID]
+--
+-- Every entry point: init_request -> savepoint -> work -> page or redirect.
+-- Errors roll back to the savepoint and show an error page, so the gateway's
+-- automatic commit never saves half a change.
+------------------------------------------------------------------------------
+
+  c_version    constant varchar2(40)  := 'plsql_wiki V2 2026-10-17';
+  c_base       constant varchar2(100) := owa_util.get_owa_service_path;  -- gateway path of this schema, e.g. /pro/owart/wiki/
+  c_url        constant varchar2(200) := c_base || 'web_wiki.show_wiki';
+  c_data_url   constant varchar2(200) := c_base || 'web_wiki.show_wiki_data';
+  c_delete_url constant varchar2(200) := c_base || 'web_wiki.delete_wiki';
+  c_rename_url constant varchar2(200) := c_base || 'web_wiki.rename_wiki';
+  c_purge_url  constant varchar2(200) := c_base || 'web_wiki.purge_wiki';
+  c_emailf_url constant varchar2(200) := c_base || 'web_wiki.email_form';
+  c_email_url  constant varchar2(200) := c_base || 'web_wiki.email_wiki';
+  c_save_url   constant varchar2(200) := c_base || '!web_wiki.saveformdata';
+  c_js_url     constant varchar2(200) := c_base || 'web_wiki.wiki_js?v=20261017';
+
+  c_app_title  constant varchar2(40)  := 'Wiki';
+  c_home       constant varchar2(80)  := 'Home';
+  c_help       constant varchar2(80)  := 'WikiHelp';
+  c_cookie     constant varchar2(30)  := 'wikilastpage';
+
+  c_keep_history  constant boolean     := true;   -- false = Save overwrites the current revision
+  c_edit_level    constant pls_integer := 2;      -- security level needed to edit
+  c_admin_level   constant pls_integer := 5;      -- may edit locked pages, purge
+  c_db_chunk      constant pls_integer := 1000;   -- chars per DDG_WIKI_DATA row (<= 4000 bytes)
+  c_same_origin   constant boolean     := true;   -- POSTs must come from this site (CSRF check);
+                                                  -- set false if a proxy rewrites the Host header
+
+  type t_pg is record
+    (id            number
+    ,topic         varchar2(200)
+    ,owner         varchar2(30)
+    ,lasteditor    varchar2(30)
+    ,ownerlock     varchar2(1)
+    ,excludesearch varchar2(1)
+    ,lastupdate    date
+    ,first_created date
+    ,latest_id     number
+    ,lt_owner      varchar2(30)      -- lock and owner always come from the current revision
+    ,lt_lock       varchar2(1)
+    ,lt_exclude    varchar2(1)
+    ,has_data      boolean);
+
+  type t_col  is record (col varchar2(128), isdate boolean, val varchar2(32767));
+  type t_cols is table of t_col index by pls_integer;
+
+  -- request state; reset by init_request on every call
+  g_user        varchar2(30);
+  g_level       number := -1;
+  g_my_home     varchar2(200);
+  g_last_page   varchar2(200);
+  g_header_sent boolean := false;
+  g_msg         varchar2(4000);
+  g_cfg         clob;
+  g_nav_count   pls_integer := 0;
+  g_pg          t_pg;
+  g_pg_empty    t_pg;               -- never assigned; used to clear g_pg
+
+  -- set by set_batch_user for non-web callers only
+  g_batch_user  varchar2(30);
+  g_batch_level number;
+
+  e_user   exception;   -- message for the user is in g_msg
+  e_denied exception;
+
+  ---------------------------------------------------------------- utilities
+  procedure fail(p_msg in varchar2) is
+  begin
+    g_msg := substr(p_msg, 1, 4000);
+    raise e_user;
+  end;
+
+  function num(p in varchar2) return number is
+  begin
+    return to_number(trim(p));
+  exception
+    when value_error or invalid_number then return null;
+  end;
+
+  function esc(p in varchar2) return varchar2 is
+  begin
+    return htf.escape_sc(p);
+  end;
+
+  function urlenc(p in varchar2) return varchar2 is
+  begin
+    return utl_url.escape(replace(p, '%', '%25'), true, 'AL32UTF8');   -- escape() leaves % alone
+  end;
+
+  -- body of a JSON/JS string literal; < > & escaped so it is safe inside <script>
+  function jsesc(p in varchar2) return varchar2 is
+    s varchar2(32767) := p;
+  begin
+    if s is null then
+      return null;
+    end if;
+    s := replace(s, '\', '\\');
+    s := replace(s, '"', '\"');
+    s := replace(s, '<', '\u003c');
+    s := replace(s, '>', '\u003e');
+    s := replace(s, '&', '\u0026');
+    s := replace(s, chr(13), '\r');
+    s := replace(s, chr(10), '\n');
+    s := replace(s, chr(9), '\t');
+    s := replace(s, chr(8), '\b');
+    s := replace(s, chr(12), '\f');
+    s := regexp_replace(s, '[[:cntrl:]]', '');   -- any other control character would break JSON.parse
+    return s;
+  end;
+
+  function jsstr(p in varchar2) return varchar2 is
+  begin
+    if p is null then
+      return 'null';
+    end if;
+    return '"' || jsesc(p) || '"';
+  end;
+
+  procedure app(c in out nocopy clob, s in varchar2) is
+  begin
+    if s is not null then
+      dbms_lob.writeappend(c, length(s), s);
+    end if;
+  end;
+
+  procedure print_clob(c in clob) is
+    l_len number := nvl(dbms_lob.getlength(c), 0);
+    l_off number := 1;
+  begin
+    while l_off <= l_len loop
+      htp.prn(dbms_lob.substr(c, 8000, l_off));     -- 8000 chars <= 32000 bytes
+      l_off := l_off + 8000;
+    end loop;
+  end;
+
+  procedure print_clob_esc(c in clob) is
+    l_len number := nvl(dbms_lob.getlength(c), 0);
+    l_off number := 1;
+  begin
+    while l_off <= l_len loop
+      htp.prn(esc(dbms_lob.substr(c, 4000, l_off)));  -- escaping can grow text 6x
+      l_off := l_off + 4000;
+    end loop;
+  end;
+
+  function cgi(p in varchar2) return varchar2 is
+  begin
+    return owa_util.get_cgi_env(p);
+  exception
+    when others then return null;
+  end;
+
+  function in_web return boolean is
+  begin
+    return nvl(owa.num_cgi_vars, 0) > 0;
+  exception
+    when others then return false;
+  end;
+
+  function safe_name(p_user in varchar2) return varchar2 is
+  begin
+    if p_user is null then
+      return null;
+    end if;
+    return nvl(wiki_env.contact_name(p_user), p_user);
+  exception
+    when others then return p_user;
+  end;
+
+  function fmt(d in date) return varchar2 is
+  begin
+    return to_char(d, 'MM/DD/YY HH24:MI');
+  end;
+
+  function topic_href(p_topic in varchar2) return varchar2 is
+  begin
+    return c_url || '?p_topic=' || urlenc(p_topic);
+  end;
+
+  function alink(p_href in varchar2, p_text in varchar2, p_title in varchar2 default null,
+                 p_extra in varchar2 default null) return varchar2 is
+  begin
+    return '<a href="' || esc(p_href) || '"'
+        || case when p_title is not null then ' title="' || esc(p_title) || '"' end
+        || case when p_extra is not null then ' ' || p_extra end
+        || '>' || esc(p_text) || '</a>';
+  end;
+
+  procedure hidden(p_name in varchar2, p_value in varchar2) is
+  begin
+    htp.p('<input type="hidden" name="' || p_name || '" value="' || esc(p_value) || '">');
+  end;
+
+  procedure undo is
+  begin
+    rollback to web_wiki_sp;
+  exception
+    when others then null;
+  end;
+
+  ------------------------------------------------------------- permissions
+  function is_admin return boolean is
+  begin
+    return nvl(g_level, -1) >= c_admin_level;
+  end;
+
+  procedure check_view is
+  begin
+    if nvl(g_level, -1) < 1 then
+      raise e_denied;
+    end if;
+  end;
+
+  function can_edit_page(p_owner in varchar2, p_lock in varchar2) return boolean is
+  begin
+    return nvl(nvl(g_level, -1) >= c_edit_level
+               and (nvl(p_lock, 'N') <> 'Y' or (p_owner is not null and p_owner = g_user) or is_admin), false);
+  end;
+
+  -- only the owner (or an admin) may change the Lock / No-Search flags
+  function can_change_flags(p_owner in varchar2) return boolean is
+  begin
+    return nvl(p_owner is null or p_owner = g_user or is_admin, false);
+  end;
+
+  procedure init_request is
+    l_name varchar2(400);
+    l_c    owa_cookie.cookie;
+  begin
+    g_user := null;  g_level := -1;  g_my_home := null;  g_last_page := null;
+    g_header_sent := false;  g_msg := null;  g_cfg := null;  g_nav_count := 0;
+    g_pg := g_pg_empty;
+
+    if in_web then
+      begin
+        g_user := wiki_env.current_user;
+      exception
+        when others then g_user := null;
+      end;
+      if g_user = '-1' then
+        g_user := null;
+      end if;
+      if g_user is not null then
+        g_level := nvl(wiki_env.security_level(g_user), -1);
+      end if;
+      begin
+        l_c := owa_cookie.get(c_cookie);
+        if l_c.num_vals > 0 then
+          g_last_page := substr(utl_url.unescape(l_c.vals(1), 'AL32UTF8'), 1, 80);
+        end if;
+      exception
+        when others then g_last_page := null;
+      end;
+    elsif g_batch_user is not null then
+      g_user  := g_batch_user;
+      g_level := nvl(g_batch_level, -1);
+    end if;
+
+    -- personal home page: contact name "Last, First" -> "First Last"
+    if g_user is not null then
+      l_name := safe_name(g_user);
+      if instr(l_name, ',') > 0 then
+        g_my_home := initcap(trim(substr(l_name, instr(l_name, ',') + 1)) || ' '
+                          || trim(substr(l_name, 1, instr(l_name, ',') - 1)));
+      elsif l_name is not null and l_name <> g_user then
+        g_my_home := initcap(trim(l_name));
+      end if;
+    end if;
+  end;
+
+  -- state-changing requests: POST from a page on this site
+  procedure require_post is
+    l_host varchar2(400);
+    l_from varchar2(4000);
+  begin
+    if not in_web then
+      return;                                  -- PL/SQL batch caller
+    end if;
+    if nvl(upper(cgi('REQUEST_METHOD')), '?') <> 'POST' then
+      fail('That action has to be submitted from the wiki page (POST).');
+    end if;
+    if c_same_origin then
+      l_host := lower(cgi('HTTP_HOST'));
+      l_from := lower(nvl(cgi('HTTP_ORIGIN'), cgi('HTTP_REFERER')));
+      if l_host is null or l_from is null
+         or nvl(regexp_substr(l_from, '^https?://([^/]+)', 1, 1, null, 1), '?') <> l_host then
+        fail('The request did not come from a wiki page on this site, so it was refused.');
+      end if;
+    end if;
+  end;
+
+  function site_url return varchar2 is
+    l_host  varchar2(400) := cgi('HTTP_HOST');
+    l_proto varchar2(20)  := lower(cgi('REQUEST_PROTOCOL'));
+  begin
+    if l_host is null then
+      return null;
+    end if;
+    if l_proto is null or l_proto not in ('http', 'https') then
+      l_proto := 'https';
+    end if;
+    return l_proto || '://' || l_host;
+  end;
+
+  ------------------------------------------------------------ page lookup
+  function latest_id_exact(p_topic in varchar2) return number is
+    l_id number;
+  begin
+    select max(id) into l_id
+      from ddg_wiki
+     where topic = p_topic
+       and deleted is null;
+    return l_id;
+  end;
+
+  -- exact name first, otherwise any capitalisation
+  function find_latest_id(p_topic in varchar2) return number is
+    l_id number;
+  begin
+    if p_topic is null then
+      return null;
+    end if;
+    l_id := latest_id_exact(p_topic);
+    if l_id is null then
+      select max(id) keep (dense_rank first order by id desc) into l_id
+        from ddg_wiki
+       where upper(topic) = upper(p_topic)
+         and deleted is null;
+    end if;
+    return l_id;
+  end;
+
+  function load_page(p_id in number, p_clob out nocopy clob) return boolean is
+    l_n number;
+  begin
+    g_pg := g_pg_empty;
+    select id, topic, owner, lasteditor, ownerlock, excludesearch, lastupdate, pageclob
+      into g_pg.id, g_pg.topic, g_pg.owner, g_pg.lasteditor, g_pg.ownerlock,
+           g_pg.excludesearch, g_pg.lastupdate, p_clob
+      from ddg_wiki
+     where id = p_id
+       and deleted is null;
+
+    select max(id), min(creation)
+      into g_pg.latest_id, g_pg.first_created
+      from ddg_wiki
+     where topic = g_pg.topic
+       and deleted is null;
+
+    select owner, ownerlock, excludesearch
+      into g_pg.lt_owner, g_pg.lt_lock, g_pg.lt_exclude
+      from ddg_wiki
+     where id = g_pg.latest_id;
+
+    select count(*) into l_n
+      from ddg_wiki_data d
+      join ddg_wiki w on w.id = d.wikiid
+     where w.topic = g_pg.topic
+       and rownum = 1;
+    g_pg.has_data := l_n > 0;
+    return true;
+  exception
+    when no_data_found then
+      g_pg := g_pg_empty;
+      return false;
+  end;
+
+  function check_topic(p in varchar2) return varchar2 is
+    l varchar2(1000) := trim(regexp_replace(substr(p, 1, 1000), '\s+', ' '));
+  begin
+    if l is null then
+      fail('Please give the document a name.');
+    end if;
+    if length(l) > 80 then
+      fail('Document names are limited to 80 characters.');
+    end if;
+    if regexp_like(l, '[][|\\<>{}]') or regexp_like(l, '[[:cntrl:]]') then
+      fail('Document names can''t contain [ ] | \ < > { } characters.');
+    end if;
+    return l;
+  end;
+
+  ------------------------------------------------------------- rendering
+  function html_decode(p in varchar2) return varchar2 is
+  begin
+    return replace(replace(replace(replace(replace(replace(
+             p, '&nbsp;', ' '), '&lt;', '<'), '&gt;', '>'), '&quot;', '"'), '&#39;', ''''), '&amp;', '&');
+  end;
+
+  -- [[Topic]] and [[Topic|label]] -> links. p_prefix makes them absolute (email).
+  function render_links(p in clob, p_prefix in varchar2 default null) return clob is
+    c_pat   constant varchar2(60) := '\[\[([^]|[]{1,200})(\|([^]]{1,400}))?\]\]';
+    l_out   clob;
+    l_pos   pls_integer := 1;
+    l_hit   pls_integer;
+    l_end   pls_integer;
+    l_len   pls_integer;
+    l_raw   varchar2(4000);
+    l_topic varchar2(4000);
+    l_label varchar2(4000);
+  begin
+    if p is null then
+      return p;
+    end if;
+    l_len := dbms_lob.getlength(p);
+    dbms_lob.createtemporary(l_out, true, dbms_lob.call);
+    loop
+      l_hit := regexp_instr(p, c_pat, l_pos);
+      exit when nvl(l_hit, 0) = 0;
+      l_end := regexp_instr(p, c_pat, l_pos, 1, 1);
+      if l_hit > l_pos then
+        dbms_lob.copy(l_out, p, l_hit - l_pos, dbms_lob.getlength(l_out) + 1, l_pos);
+      end if;
+      l_raw   := regexp_substr(p, c_pat, l_pos, 1, null, 1);
+      l_label := regexp_substr(p, c_pat, l_pos, 1, null, 3);
+      -- the link text is page HTML; the target is the plain document name
+      l_topic := trim(html_decode(regexp_replace(l_raw, '<[^>]*>', '')));
+      app(l_out, '<a class="wikilink" href="' || esc(p_prefix || topic_href(l_topic)) || '">'
+              || nvl(l_label, l_raw) || '</a>');
+      l_pos := l_end;
+    end loop;
+    if l_pos <= l_len then
+      dbms_lob.copy(l_out, p, l_len - l_pos + 1, dbms_lob.getlength(l_out) + 1, l_pos);
+    end if;
+    return l_out;
+  end;
+
+  function render_content(p in clob) return clob is
+    l clob;
+  begin
+    if p is null then
+      return null;
+    end if;
+    l := render_links(p);
+    l := regexp_replace(l, '\{br\}', chr(13), 1, 0, 'i');
+    l := regexp_replace(l, '\{underscore\}', '_', 1, 0, 'i');
+    l := regexp_replace(l, '\{(/?)(script|style)(\s[^}]*)?\}', '<\1\2\3>', 1, 0, 'i');
+    l := replace(l, '[USERID]', esc(g_user));
+    return l;
+  end;
+
+  function re_escape(p in varchar2) return varchar2 is
+    l varchar2(4000) := replace(p, '\', '\\');
+  begin
+    l := regexp_replace(l, '([.^$*+?(){}|])', '\\\1');
+    l := replace(replace(l, '[', '\['), ']', '\]');
+    return l;
+  end;
+
+  -- matches [[Topic]] and [[Topic|...  (any capitalisation)
+  function link_pattern(p_topic in varchar2) return varchar2 is
+  begin
+    return '\[\[\s*' || re_escape(p_topic) || '\s*(\||\]\])';
+  end;
+
+  ------------------------------------------------------------ page frame
+  procedure print_style is
+  begin
+    htp.p(q'~<style>
+  :root{--bar:#efefef;--line:#808080;--ink:#111;--muted:#666;--link:#1a4f8b}
+  body{margin:0;font:10pt verdana,arial,helvetica,sans-serif;color:var(--ink);background:#fff}
+  h1,h2,h3,h4,h5,h6,p,pre,ol,ul,form{margin-top:0;margin-bottom:0}
+  pre{font-size:8pt}
+  a{color:var(--link)}
+  [hidden]{display:none!important}
+  .wiki-bar{display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;justify-content:space-between;
+    background:var(--bar);border-bottom:2px solid var(--line);padding:8px 12px}
+  .wiki-head h1{display:inline;font-size:14pt;margin-right:12px}
+  .wiki-upd{font-size:8pt;color:var(--muted)}
+  .wiki-nav{font-size:9pt;line-height:1.8}
+  .wiki-nav .sep{color:#aaa;margin:0 5px}
+  .wiki-locked{color:var(--muted)}
+  .wiki-search input{font-size:9pt;width:15em;padding:2px 4px}
+  .wiki-main{padding:10px 12px}
+  .wiki-content{min-height:30vh}
+  .wiki-note{background:#fff8d6;border:1px solid #e0c96b;padding:6px 10px;margin:0 0 10px}
+  .wiki-error{background:#fde8e8;border:1px solid #d77;padding:8px 12px;margin:0 0 10px}
+  .wiki-grid{border-collapse:collapse;margin:6px 0}
+  .wiki-grid th,.wiki-grid td{border:1px solid var(--line);padding:3px 7px;vertical-align:top;text-align:left}
+  .wiki-grid th{background:#ccc}
+  .wiki-grid form{display:inline}
+  .wiki-small{font-size:8pt}
+  .wiki-foot{color:#bbb;font-size:7pt;padding:12px}
+  .wiki-toolbar{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:3px;align-items:center;
+    background:#e4e4e4;border:1px solid #c0c0c0;padding:4px;margin-bottom:6px}
+  .wiki-toolbar button,.wiki-toolbar select{font:9pt verdana,sans-serif;min-width:26px;height:26px;
+    border:1px solid #bbb;background:#fafafa;border-radius:3px;cursor:pointer}
+  .wiki-toolbar button:hover{border-color:navy}
+  .wiki-toolbar button:disabled,.wiki-toolbar select:disabled{opacity:.4;cursor:default}
+  .wiki-sep{width:1px;height:20px;background:#bbb;margin:0 3px}
+  .wiki-editor{border:1px solid #c0c0c0;padding:8px;min-height:60vh;outline:none}
+  .wiki-editor form{outline:1px dashed #89a;padding:4px;margin:4px 0}
+  .wiki-editor td,.wiki-editor th{min-width:2em}
+  .wiki-source{display:block;width:100%;min-height:60vh;font:9pt Consolas,monospace;box-sizing:border-box}
+  .wiki-savebar{position:sticky;bottom:0;display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+    background:var(--bar);border:1px solid #c0c0c0;padding:6px 8px;margin-top:6px}
+  .wiki-savebar button{font-size:9pt;padding:3px 12px}
+  .wiki-hint{color:var(--muted);font-size:8pt}
+  .wiki-panel{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:50}
+  .wiki-panel>div{background:#fff;max-width:90vw;max-height:80vh;overflow:auto;padding:12px 16px;border-radius:4px}
+  .wiki-email label{display:block;margin:8px 0} @media print{.wiki-bar,.wiki-foot{display:none}}
+</style>~');
+  end;
+
+  ------------------------------------------------- page settings for wiki.js
+  procedure cfg_begin(p_mode in varchar2) is
+  begin
+    dbms_lob.createtemporary(g_cfg, true, dbms_lob.call);
+    app(g_cfg, '{"mode":' || jsstr(p_mode) || ',"url":' || jsstr(c_url)
+            || ',"saveUrl":' || jsstr(c_save_url) || ',"user":' || jsstr(g_user));
+  end;
+
+  procedure cfg_add(p_key in varchar2, p_json in varchar2) is
+  begin
+    app(g_cfg, ',' || jsstr(p_key) || ':' || nvl(p_json, 'null'));
+  end;
+
+  procedure cfg_end is
+  begin
+    app(g_cfg, '}');
+  end;
+
+  procedure page_start(p_title in varchar2, p_cookie_topic in varchar2 default null,
+                       p_body_class in varchar2 default null) is
+  begin
+    if g_header_sent then
+      return;
+    end if;
+    if in_web then
+      owa_util.mime_header('text/html', false, 'UTF-8');
+      htp.p('Cache-Control: no-store');
+      htp.p('X-Content-Type-Options: nosniff');
+      if p_cookie_topic is not null then
+        owa_cookie.send(c_cookie, urlenc(p_cookie_topic), null, c_base);
+      end if;
+      owa_util.http_header_close;
+    end if;
+    g_header_sent := true;
+    htp.p('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">');
+    htp.p('<meta name="viewport" content="width=device-width, initial-scale=1">');
+    htp.p('<title>' || esc(c_app_title || ': ' || p_title) || '</title>');
+    print_style;
+    if g_cfg is null then
+      cfg_begin('page');
+      cfg_end;
+    end if;
+    if g_cfg is not null then
+      htp.prn('<script type="application/json" id="wikiCfg">');
+      print_clob(g_cfg);
+      htp.p('</script>');
+    end if;
+    htp.p('<script src="' || c_js_url || '"></script>');
+    begin
+      wiki_env.page_head;               -- application validation script (valforms)
+    exception
+      when others then null;
+    end;
+    htp.p('</head><body' || case when p_body_class is not null then ' class="' || p_body_class || '"' end || '>');
+  end;
+
+  procedure page_end is
+  begin
+    htp.p('</body></html>');
+  end;
+
+  procedure footer is
+  begin
+    htp.p('<footer class="wiki-foot">' || c_version || ' &middot; ' || to_char(sysdate, 'MM/DD/YYYY HH24:MI:SS')
+       || ' &middot; User: ' || esc(safe_name(g_user)) || '</footer>');
+  end;
+
+  procedure show_error(p_msg in varchar2, p_trace in varchar2 default null) is
+  begin
+    if not g_header_sent then
+      g_cfg := null;                     -- may be half built when the error happened
+    end if;
+    page_start('Error');
+    htp.p('<main class="wiki-main"><div class="wiki-error">' || esc(p_msg) || '</div>');
+    if p_trace is not null then
+      htp.p('<pre>' || esc(p_trace) || '</pre>');
+    end if;
+    htp.p('<p>' || alink(c_url, 'Wiki home') || '</p></main>');
+    page_end;
+  exception
+    when others then null;              -- never let the error page itself fail
+  end;
+
+  procedure report(p_kind in varchar2, p_err in varchar2 default null, p_trace in varchar2 default null) is
+  begin
+    if p_kind = 'USER' then
+      show_error(g_msg);
+    elsif p_kind = 'DENIED' then
+      show_error(case when nvl(g_level, -1) < 1
+                      then 'No access allowed. Please sign in to the application first.'
+                      else 'You do not have permission to do that.' end);
+    else
+      show_error('Unexpected error: ' || p_err, case when is_admin then p_trace end);
+    end if;
+  end;
+
+  procedure redirect(p_url in varchar2) is
+  begin
+    if in_web then
+      owa_util.redirect_url(p_url);
+      g_header_sent := true;
+    end if;
+  end;
+
+  -- "data":{"FIELD":["value 1","value 2"],...}  (values re-joined from their chunks)
+  procedure cfg_add_dataset(p_setid in number) is
+    l_first boolean := true;
+  begin
+    app(g_cfg, ',"data":{');
+    for r in (select fieldname, valno, seq, fieldvalue,
+                     lag(fieldname)  over (order by fieldname, valno, seq) pf,
+                     lead(fieldname) over (order by fieldname, valno, seq) nf,
+                     lead(valno)     over (order by fieldname, valno, seq) nv
+                from ddg_wiki_data
+               where datasetid = p_setid
+                 -- the old engine could leave stale copies under an older revision id
+                 and wikiid = (select max(x.wikiid) from ddg_wiki_data x where x.datasetid = p_setid)
+               order by fieldname, valno, seq)
+    loop
+      if r.pf is null or r.pf <> r.fieldname then
+        if not l_first then
+          app(g_cfg, '],');
+        end if;
+        l_first := false;
+        app(g_cfg, jsstr(r.fieldname) || ':[');
+      elsif r.seq = 1 then
+        app(g_cfg, ',');
+      end if;
+      if r.seq = 1 then
+        app(g_cfg, '"');
+      end if;
+      app(g_cfg, jsesc(r.fieldvalue));
+      if r.nf is null or r.nf <> r.fieldname or r.nv <> r.valno then
+        app(g_cfg, '"');
+      end if;
+    end loop;
+    if not l_first then
+      app(g_cfg, ']');
+    end if;
+    app(g_cfg, '}');
+  end;
+
+  ---------------------------------------------------------------- heading
+  procedure nav(p_html in varchar2) is
+  begin
+    if g_nav_count > 0 then
+      htp.prn('<span class="sep">|</span>');
+    end if;
+    htp.prn(p_html);
+    g_nav_count := g_nav_count + 1;
+  end;
+
+  procedure post_button(p_action in varchar2, p_label in varchar2, p_msg in varchar2,
+                        n1 in varchar2, v1 in varchar2,
+                        n2 in varchar2 default null, v2 in varchar2 default null,
+                        p_kind in varchar2 default 'confirm') is
+  begin
+    htp.prn('<form method="post" action="' || p_action || '" data-wiki="' || p_kind || '" data-msg="' || esc(p_msg) || '">');
+    htp.prn('<input type="hidden" name="' || n1 || '" value="' || esc(v1) || '">');
+    if n2 is not null then
+      htp.prn('<input type="hidden" name="' || n2 || '" value="' || esc(v2) || '">');
+    end if;
+    htp.prn('<button type="submit" class="wiki-small">' || esc(p_label) || '</button></form> ');
+  end;
+
+  procedure show_menu(p_title in varchar2, p_mode in varchar2, p_lite in varchar2 default null) is
+    l_lite     boolean := nvl(upper(p_lite), 'N') = 'Y';
+    l_has_page boolean := g_pg.id is not null;
+    l_can_edit boolean := l_has_page and can_edit_page(g_pg.lt_owner, g_pg.lt_lock);
+    l_edit_url varchar2(2000);
+  begin
+    g_nav_count := 0;
+    if l_has_page then
+      l_edit_url := case when g_pg.id = g_pg.latest_id
+                         then c_url || '?p_action=edit&p_topic=' || urlenc(g_pg.topic)
+                         else c_url || '?p_action=edit&p_id=' || g_pg.id end;
+    end if;
+    htp.p('<header class="wiki-bar"><div class="wiki-head"><h1>' || esc(p_title) || '</h1>');
+    if l_has_page and p_mode = 'browse' then
+      htp.p('<span class="wiki-upd">Last update: ' || fmt(g_pg.lastupdate)
+         || ' (' || esc(safe_name(g_pg.lasteditor)) || ')</span>');
+    end if;
+    htp.p('</div><nav class="wiki-nav">');
+    if l_lite then
+      if p_mode = 'browse' and l_can_edit then
+        nav(alink(l_edit_url, '[Modify]', 'Modify this document', 'target="_blank"'));
+      end if;
+    else
+      nav(alink(c_url, c_home, 'Go back to the Home document'));
+      if g_my_home is not null then
+        nav(alink(topic_href(g_my_home), 'My Home', 'Your personal home document'));
+      end if;
+      if g_last_page is not null and (g_pg.topic is null or g_last_page <> g_pg.topic) then
+        nav(alink(topic_href(g_last_page), g_last_page, 'Previous document'));
+      end if;
+      nav(alink(c_url || '?p_action=list&p_topic=ByTitle', 'List of Documents', 'List all documents'));
+      nav(alink(c_url || '?p_action=list&p_topic=ByDate&p_dir=d', 'Changes', 'Recently changed documents'));
+      if nvl(g_level, -1) >= c_edit_level then
+        nav('<a href="#" data-wiki="new" title="Create a new document">New Document</a>');
+      end if;
+      if l_has_page and p_mode = 'browse' then
+        nav(alink(c_url || '?p_action=refs&p_topic=' || urlenc(g_pg.topic), 'References', 'Documents that link here'));
+        nav(alink(c_url || '?p_action=log&p_topic=' || urlenc(g_pg.topic), 'History', 'Revision history'));
+        if l_can_edit then
+          nav(alink(l_edit_url, case when g_pg.id = g_pg.latest_id then '[Modify]' else '[Restore this revision]' end,
+                    'Modify this document'));
+        elsif nvl(g_pg.lt_lock, 'N') = 'Y' then
+          nav('<span class="wiki-locked" title="Locked by ' || esc(safe_name(g_pg.lt_owner)) || '">[Locked]</span>');
+        end if;
+        if g_pg.has_data then
+          nav(alink(c_data_url || '?p_topic=' || urlenc(g_pg.topic), '[Records]', 'Saved form records'));
+        end if;
+        nav(alink(c_emailf_url || '?p_topic=' || urlenc(g_pg.topic), '[Email]', 'Email this document',
+                  'data-wiki="popup" target="wikipopup"'));
+        nav('<a href="#" data-wiki="print" title="Print this document">[Print]</a>');
+      end if;
+      nav(alink(topic_href(c_help), '[Help]', 'Wiki help'));
+    end if;
+    htp.p('</nav>');
+    if not l_lite then
+      htp.p('<form class="wiki-search" method="get" action="' || c_url || '">'
+         || '<input type="hidden" name="p_action" value="search">'
+         || '<input type="search" name="p_topic" maxlength="200" placeholder="Search" aria-label="Search the wiki">'
+         || '</form>');
+    end if;
+    htp.p('</header>');
+  end;
+
+  -------------------------------------------------------------- browse
+  procedure do_browse(p_id in varchar2, p_topic in varchar2, p_dir in varchar2, p_datasetid in varchar2,
+                      p_lite in varchar2, p_extralite in varchar2, p_arg in varchar2) is
+    l_id     number := num(p_id);
+    l_topic  varchar2(1000) := trim(substr(p_topic, 1, 1000));
+    l_clob   clob;
+    l_found  boolean := false;
+    l_setid  number := num(p_datasetid);
+    l_n      number;
+    l_extra  boolean := nvl(upper(p_extralite), 'N') = 'Y';
+    l_title  varchar2(1000);
+  begin
+    if l_topic is null and l_id is null then
+      l_topic := c_home;
+    end if;
+
+    if l_id is not null then
+      l_found := load_page(l_id, l_clob);
+    elsif p_dir is not null and l_topic is not null then
+      -- old revision links used the save timestamp
+      begin
+        select max(id) into l_id
+          from ddg_wiki
+         where topic = l_topic
+           and deleted is null
+           and lastupdate = to_date(p_dir, 'MM-DD-YYYY HH24:MI:SS');
+      exception
+        when others then l_id := null;
+      end;
+      if l_id is not null then
+        l_found := load_page(l_id, l_clob);
+      end if;
+    end if;
+    if not l_found and l_topic is not null then
+      l_id := find_latest_id(l_topic);
+      if l_id is not null then
+        l_found := load_page(l_id, l_clob);
+      end if;
+    end if;
+
+    -- a saved record can only be opened on the document it belongs to
+    if l_found and l_setid is not null then
+      select count(*) into l_n
+        from ddg_wiki_data d
+        join ddg_wiki w on w.id = d.wikiid
+       where d.datasetid = l_setid
+         and w.topic = g_pg.topic
+         and rownum = 1;
+      if l_n = 0 then
+        l_setid := null;
+      end if;
+    else
+      l_setid := null;
+    end if;
+
+    cfg_begin('browse');
+    cfg_add('arg', jsstr(substr(p_arg, 1, 4000)));
+    if l_found then
+      cfg_add('topic', jsstr(g_pg.topic));
+      cfg_add('wikiId', jsstr(to_char(g_pg.id)));
+      cfg_add('datasetId', jsstr(to_char(l_setid)));
+      if l_setid is not null then
+        cfg_add_dataset(l_setid);
+      end if;
+    end if;
+    cfg_end;
+
+    l_title := case when l_found then g_pg.topic else l_topic end;
+    page_start(l_title,
+               case when l_found
+                     and upper(g_pg.topic) not in (upper(c_home), upper(c_help), nvl(upper(g_my_home), '~'))
+                    then g_pg.topic end);
+    if not l_extra then
+      show_menu(l_title, 'browse', p_lite);
+    end if;
+    htp.p('<main class="wiki-main">');
+
+    if not l_found then
+      htp.p('<p class="wiki-note">There is no document named <b>' || esc(l_topic) || '</b> yet.</p>');
+      if nvl(g_level, -1) >= c_edit_level then
+        htp.p('<p>' || alink(c_url || '?p_action=edit&p_topic=' || urlenc(l_topic), 'Create it now') || '</p>');
+      end if;
+    else
+      if g_pg.id <> g_pg.latest_id and not l_extra then
+        htp.p('<div class="wiki-note">This is an older revision, saved ' || fmt(g_pg.lastupdate) || ' by '
+           || esc(safe_name(g_pg.lasteditor)) || '. ' || alink(topic_href(g_pg.topic), 'View the current version') || '</div>');
+      end if;
+      if l_setid is not null and not l_extra then
+        htp.p('<div class="wiki-note">Showing a saved record; saving the form updates it. '
+           || alink(topic_href(g_pg.topic), 'Start a new record instead') || '</div>');
+      end if;
+      htp.prn('<div id="idtopic" class="wiki-content">');
+      print_clob(render_content(l_clob));
+      htp.p('</div>');
+    end if;
+    htp.p('</main>');
+    if not l_extra then
+      footer;
+    end if;
+    page_end;
+  end;
+
+  ---------------------------------------------------------------- edit
+  procedure edit_form(p_source_id in number, p_topic in varchar2, p_content in clob, p_base_id in number,
+                      p_owner in varchar2, p_lock in varchar2, p_exclude in varchar2,
+                      p_conflict in boolean, p_is_new in boolean) is
+    l_flags boolean := can_change_flags(p_owner);
+    l_dis   varchar2(20) := case when not l_flags then ' disabled' end;
+  begin
+    cfg_begin('edit');
+    cfg_add('topic', jsstr(p_topic));
+    cfg_end;
+    page_start('Modify ' || p_topic, null, 'wiki-editing');
+    show_menu('Modify ' || p_topic, 'edit');
+    htp.p('<main class="wiki-main">');
+    if p_conflict then
+      htp.p('<div class="wiki-error"><b>Someone else saved this document after you started editing.</b> '
+         || 'Your text is below. ' || alink(topic_href(p_topic), 'Open their version in a new tab', null, 'target="_blank"')
+         || ' to compare, then Save again to replace it with yours.</div>');
+    elsif p_is_new then
+      htp.p('<div class="wiki-note">New document. Nothing is stored until you click Save.</div>');
+    elsif p_source_id is not null and p_base_id is not null and p_source_id <> p_base_id then
+      htp.p('<div class="wiki-note">You are editing an older revision. Saving it makes it the current version.</div>');
+    end if;
+
+    -- The editor sits outside the save form: page content may contain its own <form>.
+    htp.p('<div id="wikiToolbar" class="wiki-toolbar" role="toolbar" aria-label="Formatting"></div>');
+    htp.p('<div id="wikiEditor" class="wiki-content wiki-editor" contenteditable="true" spellcheck="true"></div>');
+    htp.p('<textarea id="wikiSource" class="wiki-source" spellcheck="false" aria-label="HTML source" hidden>');
+    print_clob_esc(p_content);
+    htp.p('</textarea>');
+
+    htp.p('<form id="wikiSaveForm" class="wiki-savebar" method="post" action="' || c_url || '">');
+    hidden('p_action', 'edit');
+    hidden('p_topic', p_topic);
+    hidden('p_topic_new', null);
+    hidden('p_id', to_char(p_source_id));
+    hidden('p_base_id', to_char(p_base_id));
+    htp.p('<label title="Only the owner can edit a locked document"><input type="checkbox" name="p_ownerlock" value="Y"'
+       || case when p_lock = 'Y' then ' checked' end || l_dis || '> Lock</label>');
+    htp.p('<label title="Hide from other people''s searches"><input type="checkbox" name="p_excludesearch" value="Y"'
+       || case when p_exclude = 'Y' then ' checked' end || l_dis || '> No-Search</label>');
+    htp.p('<button type="submit" name="p_dir" value="Save">Save</button>');
+    htp.p('<button type="submit" name="p_dir" value="Save As">Save As</button>');
+    htp.p(alink(case when p_is_new then c_url else topic_href(p_topic) end, 'Cancel'));
+    htp.p('<span class="wiki-hint">Ctrl+S saves</span></form></main>');
+    page_end;
+  end;
+
+  procedure do_edit(p_id in varchar2, p_topic in varchar2) is
+    l_id    number := num(p_id);
+    l_clob  clob;
+    l_found boolean := false;
+    l_topic varchar2(200);
+  begin
+    if nvl(g_level, -1) < c_edit_level then
+      raise e_denied;
+    end if;
+    if l_id is not null then
+      l_found := load_page(l_id, l_clob);
+    end if;
+    if not l_found and p_topic is not null then
+      l_id := find_latest_id(p_topic);
+      if l_id is not null then
+        l_found := load_page(l_id, l_clob);
+      end if;
+    end if;
+
+    if l_found then
+      if not can_edit_page(g_pg.lt_owner, g_pg.lt_lock) then
+        fail('"' || g_pg.topic || '" is locked by its owner, ' || safe_name(g_pg.lt_owner) || '.');
+      end if;
+      edit_form(g_pg.id, g_pg.topic, l_clob, g_pg.latest_id, g_pg.lt_owner, g_pg.lt_lock, g_pg.lt_exclude,
+                false, false);
+    else
+      -- nothing is inserted until the first Save
+      l_topic := check_topic(p_topic);
+      g_pg := g_pg_empty;
+      edit_form(null, l_topic, null, null, null, null, null, false, true);
+    end if;
+  end;
+
+  procedure do_save(p_id in varchar2, p_topic in varchar2, p_topic_new in varchar2, p_dir in varchar2,
+                    p_data in owa.vc_arr, p_ownerlock in varchar2, p_excludesearch in varchar2,
+                    p_base_id in varchar2, p_force in varchar2) is
+    l_saveas boolean := p_dir = 'Save As';
+    l_topic  varchar2(200);
+    l_clob   clob;
+    l_latest number;
+    l_owner  varchar2(30);
+    l_lock   varchar2(1);
+    l_excl   varchar2(1);
+    l_first  date;
+    l_dummy  number;
+    i        pls_integer;
+  begin
+    if nvl(g_level, -1) < c_edit_level then
+      raise e_denied;
+    end if;
+    require_post;
+
+    if l_saveas then
+      l_topic := check_topic(p_topic_new);
+      if find_latest_id(l_topic) is not null then
+        fail('A document named "' || l_topic || '" already exists. Choose another name.');
+      end if;
+    elsif p_topic is not null and latest_id_exact(p_topic) is not null then
+      l_topic := p_topic;                       -- existing page: keep its name exactly
+    else
+      l_topic := check_topic(p_topic);
+      if find_latest_id(l_topic) is not null and latest_id_exact(l_topic) is null then
+        fail('A document named "' || l_topic || '" already exists with different capitalization.');
+      end if;
+    end if;
+
+    dbms_lob.createtemporary(l_clob, true, dbms_lob.call);
+    i := p_data.first;
+    while i is not null loop
+      app(l_clob, p_data(i));
+      i := p_data.next(i);
+    end loop;
+
+    l_latest := latest_id_exact(l_topic);
+    if l_latest is not null then
+      -- serialise saves of the same page, then look again in case someone saved while we waited
+      select id into l_dummy from ddg_wiki where id = l_latest for update;
+      l_latest := latest_id_exact(l_topic);
+      select owner, ownerlock, excludesearch into l_owner, l_lock, l_excl
+        from ddg_wiki
+       where id = l_latest;
+      select min(creation) into l_first
+        from ddg_wiki
+       where topic = l_topic
+         and deleted is null;
+
+      if not can_edit_page(l_owner, l_lock) then
+        fail('"' || l_topic || '" is locked by its owner, ' || safe_name(l_owner) || '. Your changes were not saved.');
+      end if;
+
+      if nvl(num(p_base_id), -1) <> l_latest and nvl(p_force, 'N') <> 'Y' then
+        g_pg := g_pg_empty;
+        edit_form(num(p_id), l_topic, l_clob, l_latest, l_owner, l_lock, l_excl, true, false);
+        return;
+      end if;
+    else
+      l_owner := g_user;
+    end if;
+
+    if can_change_flags(l_owner) then
+      l_lock := case when p_ownerlock = 'Y' then 'Y' end;
+      l_excl := case when p_excludesearch = 'Y' then 'Y' end;
+    end if;
+
+    if c_keep_history or l_latest is null then
+      insert into ddg_wiki (topic, lasteditor, owner, ownerlock, excludesearch, creation, pageclob)
+      values (l_topic, g_user, l_owner, l_lock, l_excl, nvl(l_first, sysdate), l_clob);
+    else
+      update ddg_wiki
+         set lasteditor = g_user, ownerlock = l_lock, excludesearch = l_excl,
+             pageclob = l_clob, lastupdate = sysdate
+       where id = l_latest;
+    end if;
+    redirect(topic_href(l_topic));
+  end;
+
+  --------------------------------------------------------- list / history
+  procedure do_list(p_topic in varchar2, p_dir in varchar2) is
+    l_bydate boolean := nvl(upper(p_topic), 'X') = 'BYDATE';
+    l_desc   boolean := nvl(lower(p_dir), 'a') = 'd';
+    l_sort   varchar2(2) := case when l_bydate then 'D' else 'T' end || case when l_desc then 'D' else 'A' end;
+    l_next   varchar2(1) := case when l_desc then 'a' else 'd' end;
+    l_n      pls_integer := 0;
+  begin
+    page_start('List of Documents');
+    show_menu('List of Documents', 'list');
+    htp.p('<main class="wiki-main"><table class="wiki-grid"><tr>'
+       || '<th>' || alink(c_url || '?p_action=list&p_topic=ByTitle&p_dir=' || l_next, 'Title') || '</th>'
+       || '<th>' || alink(c_url || '?p_action=list&p_topic=ByDate&p_dir=' || l_next, 'Modified') || '</th>'
+       || '<th>Editor</th><th>Created</th><th>Owner</th><th>Revisions</th><th>Records</th><th></th></tr>');
+    for r in (
+      select v.id, v.topic, v.lastupdate, v.lasteditor, v.owner, v.ownerlock, v.nrev, v.first_created,
+             (select count(distinct d.datasetid)
+                from ddg_wiki_data d
+                join ddg_wiki x on x.id = d.wikiid
+               where x.topic = v.topic) ndata
+        from (select w.id, w.topic, w.lastupdate, w.lasteditor, w.owner, w.ownerlock,
+                     row_number() over (partition by w.topic order by w.id desc) rn,
+                     count(*)     over (partition by w.topic) nrev,
+                     min(w.creation) over (partition by w.topic) first_created
+                from ddg_wiki w
+               where w.deleted is null) v
+       where v.rn = 1
+       order by case when l_sort = 'DA' then v.lastupdate end asc,
+                case when l_sort = 'DD' then v.lastupdate end desc,
+                case when l_sort = 'TA' then upper(v.topic) end asc,
+                case when l_sort = 'TD' then upper(v.topic) end desc,
+                v.topic)
+    loop
+      l_n := l_n + 1;
+      htp.p('<tr><td>' || alink(topic_href(r.topic), r.topic)
+         || case when r.ownerlock = 'Y' then ' <span class="wiki-locked" title="Locked">&#128274;</span>' end || '</td>'
+         || '<td>' || fmt(r.lastupdate) || '</td>'
+         || '<td>' || esc(safe_name(r.lasteditor)) || '</td>'
+         || '<td>' || fmt(r.first_created) || '</td>'
+         || '<td>' || esc(safe_name(r.owner)) || '</td>'
+         || '<td>' || alink(c_url || '?p_action=log&p_topic=' || urlenc(r.topic), to_char(r.nrev)) || '</td>'
+         || '<td>' || case when r.ndata > 0 then alink(c_data_url || '?p_topic=' || urlenc(r.topic), to_char(r.ndata)) end
+         || '</td><td>');
+      if can_edit_page(r.owner, r.ownerlock) then
+        post_button(c_rename_url, 'Rename', null, 'p_topic_old', r.topic, 'p_topic_new', null, 'rename');
+        post_button(c_delete_url, 'Delete', 'Delete "' || r.topic || '" and all its revisions?', 'p_topic', r.topic);
+      end if;
+      htp.p('</td></tr>');
+    end loop;
+    htp.p('</table><p>' || l_n || ' documents.</p>');
+    if is_admin then
+      post_button(c_purge_url, 'Purge deleted documents',
+                  'Permanently remove every deleted revision (and records of deleted documents)? This cannot be undone.',
+                  'p_topic', null);
+    end if;
+    htp.p('</main>');
+    footer;
+    page_end;
+  end;
+
+  procedure do_log(p_topic in varchar2) is
+    l_latest number := find_latest_id(p_topic);
+    l_clob   clob;
+    l_ok     boolean;
+    l_can    boolean;
+    l_title  varchar2(400);
+  begin
+    if l_latest is null then
+      fail('There is no document named "' || p_topic || '".');
+    end if;
+    l_ok    := load_page(l_latest, l_clob);
+    l_can   := can_edit_page(g_pg.lt_owner, g_pg.lt_lock);
+    l_title := 'History of ' || g_pg.topic;
+    page_start(l_title);
+    show_menu(l_title, 'log');
+    htp.p('<main class="wiki-main"><p>' || alink(topic_href(g_pg.topic), 'Back to the document') || '</p>');
+    htp.p('<table class="wiki-grid"><tr><th>Revision</th><th>Saved</th><th>Editor</th><th>Records</th><th></th></tr>');
+    for r in (select w.id, w.lastupdate, w.lasteditor,
+                     (select count(distinct d.datasetid) from ddg_wiki_data d where d.wikiid = w.id) ndata
+                from ddg_wiki w
+               where w.topic = g_pg.topic
+                 and w.deleted is null
+               order by w.id desc)
+    loop
+      htp.p('<tr><td>' || alink(c_url || '?p_id=' || r.id, case when r.id = l_latest then 'Current' else 'View' end)
+         || '</td><td>' || fmt(r.lastupdate) || '</td><td>' || esc(safe_name(r.lasteditor)) || '</td><td>'
+         || case when r.ndata > 0 then alink(c_data_url || '?p_id=' || r.id, to_char(r.ndata)) end || '</td><td>');
+      if l_can then
+        if r.id <> l_latest then
+          htp.prn(alink(c_url || '?p_action=edit&p_id=' || r.id, 'Restore', 'Open this revision in the editor') || ' ');
+        end if;
+        post_button(c_delete_url, 'Delete', 'Delete this revision?', 'p_id', to_char(r.id), 'p_topic', g_pg.topic);
+      end if;
+      htp.p('</td></tr>');
+    end loop;
+    htp.p('</table></main>');
+    footer;
+    page_end;
+  end;
+
+  ---------------------------------------------------------- search / refs
+  procedure do_search(p_q in varchar2, p_refs in boolean) is
+    l_q     varchar2(400) := trim(substr(p_q, 1, 200));
+    l_refs  varchar2(1) := case when p_refs then 'Y' else 'N' end;
+    l_like1 varchar2(2000);
+    l_like2 varchar2(2000);
+    l_re1   varchar2(4000);
+    l_re2   varchar2(4000);
+    l_n     pls_integer := 0;
+    l_title varchar2(400);
+
+    function lk(s in varchar2) return varchar2 is
+    begin
+      return '%' || lower(replace(replace(replace(s, '\', '\\'), '%', '\%'), '_', '\_')) || '%';
+    end;
+  begin
+    if l_q is null then
+      fail('Type something to search for.');
+    end if;
+    l_like1 := lk(l_q);
+    l_like2 := lk(esc(l_q));                     -- page text is stored as HTML
+    l_re1   := link_pattern(l_q);
+    l_re2   := link_pattern(esc(l_q));
+    l_title := case when p_refs then 'Documents that link to ' else 'Search results for ' end || l_q;
+
+    page_start(l_title);
+    show_menu(l_title, 'search');
+    htp.p('<main class="wiki-main"><table class="wiki-grid"><tr><th>Title</th><th>Modified</th><th>Editor</th>'
+       || '<th>Created</th><th>Owner</th></tr>');
+    for r in (
+      select id, topic, lastupdate, lasteditor, owner, first_created
+        from (select w.id, w.topic, w.lastupdate, w.lasteditor, w.owner, w.excludesearch, w.pageclob,
+                     row_number() over (partition by w.topic order by w.id desc) rn,
+                     min(w.creation) over (partition by w.topic) first_created
+                from ddg_wiki w
+               where w.deleted is null)
+       where rn = 1
+         and (nvl(excludesearch, 'N') <> 'Y' or owner = g_user)
+         and (   (l_refs = 'N' and (   lower(topic) like l_like1 escape '\'
+                                    or lower(pageclob) like l_like1 escape '\'
+                                    or lower(pageclob) like l_like2 escape '\'))
+              or (l_refs = 'Y' and (   regexp_like(pageclob, l_re1, 'i')
+                                    or regexp_like(pageclob, l_re2, 'i'))))
+       order by upper(topic))
+    loop
+      l_n := l_n + 1;
+      htp.p('<tr><td>' || alink(topic_href(r.topic), r.topic) || '</td><td>' || fmt(r.lastupdate) || '</td><td>'
+         || esc(safe_name(r.lasteditor)) || '</td><td>' || fmt(r.first_created) || '</td><td>'
+         || esc(safe_name(r.owner)) || '</td></tr>');
+    end loop;
+    htp.p('</table><p>' || case when l_n = 0 then 'Nothing found.' else l_n || ' found.' end || '</p></main>');
+    footer;
+    page_end;
+  end;
+
+  ------------------------------------------------------------ form saving
+  -- all values posted under one field name, comma separated (case-insensitive name)
+  function form_val(p_names in owa.vc_arr, p_values in owa.vc_arr, p_name in varchar2) return varchar2 is
+    l     varchar2(32767);
+    l_cnt pls_integer := 0;
+  begin
+    for i in 1 .. p_names.count loop
+      if upper(p_names(i)) = upper(p_name) and p_values.exists(i) and p_values(i) is not null then
+        l_cnt := l_cnt + 1;
+        l := case when l_cnt > 1 then l || ',' end || p_values(i);
+      end if;
+    end loop;
+    return l;
+  end;
+
+  procedure save_dataset(p_wikiid in number, p_topic in varchar2, p_setid in out number,
+                         p_names in owa.vc_arr, p_values in owa.vc_arr) is
+    type t_cnt is table of pls_integer index by varchar2(400);
+    l_cnt        t_cnt;
+    l_key        varchar2(400);
+    l_name       varchar2(400);
+    l_val        varchar2(32767);
+    l_rows       number;
+    l_settopic   varchar2(200);
+    l_created    date;
+    l_whocreated varchar2(30);
+    l_valno      pls_integer;
+    l_seq        pls_integer;
+    l_pos        pls_integer;
+  begin
+    if p_setid is not null then
+      select count(*), max(w.topic), min(d.dtcreated), max(d.whocreated) keep (dense_rank first order by d.dtcreated)
+        into l_rows, l_settopic, l_created, l_whocreated
+        from ddg_wiki_data d
+        join ddg_wiki w on w.id = d.wikiid
+       where d.datasetid = p_setid;
+      if l_rows = 0 then
+        p_setid := null;                         -- unknown record: save as a new one
+      elsif l_settopic <> p_topic then
+        fail('That record belongs to a different document.');
+      elsif nvl(g_level, -1) < c_edit_level and nvl(l_whocreated, '~') <> g_user then
+        fail('Only the person who created this record, or an editor, can change it.');
+      else
+        delete from ddg_wiki_data where datasetid = p_setid;   -- rewritten in full below
+      end if;
+    end if;
+    if p_setid is null then
+      p_setid := ddg_wiki_data_set_seq.nextval;
+    end if;
+
+    for i in 1 .. p_names.count loop
+      l_name := substr(trim(p_names(i)), 1, 100);
+      if l_name is not null
+         and upper(l_name) not in ('WIKIID', 'WIKIDATASETID')
+         and substr(l_name, 1, 1) <> '_' then
+        l_key   := upper(l_name);
+        l_valno := case when l_cnt.exists(l_key) then l_cnt(l_key) + 1 else 1 end;
+        l_cnt(l_key) := l_valno;
+        l_val := case when p_values.exists(i) then p_values(i) end;
+        l_seq := 1;
+        l_pos := 1;
+        loop
+          insert into ddg_wiki_data
+            (datasetid, wikiid, fieldname, valno, seq, fieldvalue, dtcreated, whocreated, dtupdated, whoupdated)
+          values
+            (p_setid, p_wikiid, l_name, l_valno, l_seq, substr(l_val, l_pos, c_db_chunk),
+             nvl(l_created, sysdate), nvl(l_whocreated, g_user), sysdate, g_user);
+          l_pos := l_pos + c_db_chunk;
+          exit when l_pos > nvl(length(l_val), 0);
+          l_seq := l_seq + 1;
+        end loop;
+      end if;
+    end loop;
+  end;
+
+  function run_dml(p_sql in varchar2, p_cols in t_cols, p_skip in varchar2, p_pkval in varchar2) return integer is
+    c integer;
+    r integer;
+  begin
+    c := dbms_sql.open_cursor;
+    begin
+      dbms_sql.parse(c, p_sql, dbms_sql.native);
+      for j in 1 .. p_cols.count loop
+        if p_skip is null or p_cols(j).col <> p_skip then
+          dbms_sql.bind_variable(c, ':b' || j, p_cols(j).val);
+        end if;
+      end loop;
+      if p_pkval is not null then
+        dbms_sql.bind_variable(c, ':pk', p_pkval);
+      end if;
+      r := dbms_sql.execute(c);
+      dbms_sql.close_cursor(c);
+      return r;
+    exception
+      when others then
+        if dbms_sql.is_open(c) then
+          dbms_sql.close_cursor(c);
+        end if;
+        raise;
+    end;
+  end;
+
+  -- database forms: insert/update a whitelisted table with bind variables
+  procedure save_to_table(p_table in varchar2, p_pk in varchar2, p_names in owa.vc_arr, p_values in owa.vc_arr,
+                          p_result out varchar2) is
+    l_table   varchar2(128) := upper(trim(substr(p_table, 1, 128)));
+    l_pkcol   varchar2(128);
+    l_minlvl  number;
+    l_cols    t_cols;
+    n         pls_integer := 0;
+    k         pls_integer := 0;
+    l_name    varchar2(400);
+    l_col     varchar2(400);
+    l_isdate  boolean;
+    l_dup     boolean;
+    l_exists  number;
+    l_pkval   varchar2(4000);
+    l_pk_in   boolean := false;
+    l_sql     varchar2(32767);
+    l_ins_c   varchar2(32767);
+    l_ins_v   varchar2(32767);
+    l_rows    integer := 0;
+
+    function bindx(j in pls_integer) return varchar2 is
+    begin
+      return case when l_cols(j).isdate then 'wiki_env.date_value(:b' || j || ')' else ':b' || j end;
+    end;
+  begin
+    begin
+      select upper(pk_column), nvl(min_seclevel, 1)
+        into l_pkcol, l_minlvl
+        from ddg_wiki_form_tables
+       where table_name = l_table
+         and enabled = 'Y';
+    exception
+      when no_data_found then
+        fail('This form saves to table ' || l_table || ', which wiki forms are not allowed to write to. '
+          || 'An administrator can allow it in DDG_WIKI_FORM_TABLES.');
+    end;
+    if nvl(g_level, -1) < l_minlvl then
+      raise e_denied;
+    end if;
+    if p_pk is not null and upper(trim(p_pk)) <> l_pkcol then
+      fail('The form''s key column (' || p_pk || ') does not match the registered key ' || l_pkcol || '.');
+    end if;
+
+    for i in 1 .. p_names.count loop
+      l_name   := upper(trim(p_names(i)));
+      l_isdate := l_name like 'DBDT\_%' escape '\';
+      if l_isdate or l_name like 'DB\_%' escape '\' then
+        l_col := substr(l_name, instr(l_name, '_') + 1);
+        if l_col is not null and l_col <> 'ROWID' and length(l_col) <= 128 then
+          l_dup := false;
+          for j in 1 .. n loop
+            if l_cols(j).col = l_col then
+              l_dup := true;
+              exit;
+            end if;
+          end loop;
+          if not l_dup then
+            select count(*) into l_exists
+              from user_tab_columns
+             where table_name = l_table
+               and column_name = l_col;
+            if l_exists = 0 then
+              fail('Table ' || l_table || ' has no column ' || l_col || ' (form field ' || p_names(i) || ').');
+            end if;
+            n := n + 1;
+            l_cols(n).col    := l_col;
+            l_cols(n).isdate := l_isdate;
+            l_cols(n).val    := case when l_isdate
+                                     then case when p_values.exists(i) then p_values(i) end
+                                     else form_val(p_names, p_values, p_names(i)) end;
+            if l_col = l_pkcol then
+              l_pk_in := true;
+            end if;
+          end if;
+        end if;
+      end if;
+    end loop;
+    if n = 0 then
+      fail('The form has no DB_ fields to save.');
+    end if;
+
+    l_pkval := form_val(p_names, p_values, l_pkcol);
+    if l_pkval is null then
+      l_pkval := form_val(p_names, p_values, 'DB_' || l_pkcol);
+    end if;
+    if l_pkval is null then
+      l_pkval := form_val(p_names, p_values, 'DBDT_' || l_pkcol);
+    end if;
+
+    -- update when a key value was posted ...
+    if l_pkval is not null then
+      l_sql := 'update ' || dbms_assert.enquote_name(l_table, false) || ' set ';
+      for j in 1 .. n loop
+        if l_cols(j).col <> l_pkcol then
+          k := k + 1;
+          l_sql := l_sql || case when k > 1 then ', ' end
+                || dbms_assert.enquote_name(l_cols(j).col, false) || ' = ' || bindx(j);
+        end if;
+      end loop;
+      if k > 0 then
+        l_sql  := l_sql || ' where ' || dbms_assert.enquote_name(l_pkcol, false) || ' = :pk';
+        l_rows := run_dml(l_sql, l_cols, l_pkcol, l_pkval);
+      else
+        execute immediate 'select count(*) from ' || dbms_assert.enquote_name(l_table, false)
+                       || ' where ' || dbms_assert.enquote_name(l_pkcol, false) || ' = :pk'
+          into l_rows using l_pkval;
+      end if;
+      if l_rows > 0 then
+        p_result := 'updated';
+        return;
+      end if;
+    end if;
+
+    -- ... otherwise (or when no row has that key) insert
+    if l_pkval is not null and not l_pk_in then
+      l_ins_c := dbms_assert.enquote_name(l_pkcol, false);
+      l_ins_v := ':pk';
+    end if;
+    for j in 1 .. n loop
+      l_ins_c := l_ins_c || case when l_ins_c is not null then ', ' end || dbms_assert.enquote_name(l_cols(j).col, false);
+      l_ins_v := l_ins_v || case when l_ins_v is not null then ', ' end || bindx(j);
+    end loop;
+    l_sql := 'insert into ' || dbms_assert.enquote_name(l_table, false) || ' (' || l_ins_c || ') values (' || l_ins_v || ')';
+    l_rows := run_dml(l_sql, l_cols, null, case when l_pkval is not null and not l_pk_in then l_pkval end);
+    p_result := 'added';
+  end;
+
+  --========================================================== entry points
+  procedure show_wiki
+    (p_action        in varchar2   default null
+    ,p_id            in varchar2   default null
+    ,p_topic         in varchar2   default null
+    ,p_dir           in varchar2   default null
+    ,p_data          in owa.vc_arr default empty_vc_arr
+    ,p_ownerlock     in varchar2   default null
+    ,p_datasetid     in varchar2   default null
+    ,p_excludesearch in varchar2   default null
+    ,p_topic_new     in varchar2   default null
+    ,p_lite          in varchar2   default null
+    ,p_extralite     in varchar2   default null
+    ,p_arg           in varchar2   default null
+    ,p_base_id       in varchar2   default null
+    ,p_force         in varchar2   default null
+    ) is
+    l_action varchar2(20) := lower(nvl(substr(p_action, 1, 20), 'browse'));
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    if l_action = 'edit' then
+      if p_dir in ('Save', 'Save As') then
+        do_save(p_id, p_topic, p_topic_new, p_dir, p_data, p_ownerlock, p_excludesearch, p_base_id, p_force);
+      else
+        do_edit(p_id, p_topic);
+      end if;
+    elsif l_action = 'list' then
+      do_list(p_topic, p_dir);
+    elsif l_action = 'log' then
+      do_log(p_topic);
+    elsif l_action = 'search' then
+      do_search(p_topic, false);
+    elsif l_action = 'refs' then
+      do_search(p_topic, true);
+    else
+      do_browse(p_id, p_topic, p_dir, p_datasetid, p_lite, p_extralite, p_arg);
+    end if;
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end show_wiki;
+
+  procedure saveformdata
+    (name_array  in owa.vc_arr default empty_vc_arr
+    ,value_array in owa.vc_arr default empty_vc_arr) is
+    l_wikiid number;
+    l_setid  number;
+    l_table  varchar2(400);
+    l_topic  varchar2(200);
+    l_result varchar2(20);
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    require_post;
+    l_wikiid := num(form_val(name_array, value_array, 'WIKIID'));
+    l_setid  := num(form_val(name_array, value_array, 'WIKIDATASETID'));
+    l_table  := form_val(name_array, value_array, '_DBTABLE');
+    if l_wikiid is null then
+      fail('This form is not attached to a wiki document.');
+    end if;
+    begin
+      select topic into l_topic from ddg_wiki where id = l_wikiid and deleted is null;
+    exception
+      when no_data_found then fail('The wiki document for this form no longer exists.');
+    end;
+
+    if l_table is not null then
+      save_to_table(l_table, form_val(name_array, value_array, '_DBPK'), name_array, value_array, l_result);
+      page_start('Saved');
+      htp.p('<main class="wiki-main"><div class="wiki-note">Record ' || l_result || '.</div>');
+      htp.p('<p>' || alink(topic_href(l_topic), 'Back to ' || l_topic) || '</p></main>');
+    else
+      save_dataset(l_wikiid, l_topic, l_setid, name_array, value_array);
+      page_start('Saved');
+      htp.p('<main class="wiki-main"><div class="wiki-note">Saved.</div><ul>');
+      htp.p('<li>' || alink(c_url || '?p_topic=' || urlenc(l_topic) || '&p_datasetid=' || l_setid,
+                            'Open this record again to change it') || '</li>');
+      htp.p('<li>' || alink(topic_href(l_topic), 'Fill in a new record') || '</li>');
+      htp.p('<li>' || alink(c_data_url || '?p_topic=' || urlenc(l_topic), 'All records for ' || l_topic) || '</li>');
+      htp.p('</ul></main>');
+    end if;
+    page_end;
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end saveformdata;
+
+  procedure show_wiki_data
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null) is
+    l_id    number := num(p_id);
+    l_topic varchar2(200);
+    l_n     pls_integer := 0;
+    l_title varchar2(400);
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    if l_id is not null then
+      begin
+        select topic into l_topic from ddg_wiki where id = l_id and deleted is null;
+      exception
+        when no_data_found then fail('That revision no longer exists.');
+      end;
+    else
+      l_topic := p_topic;
+    end if;
+    if latest_id_exact(l_topic) is null then
+      fail('There is no document named "' || l_topic || '".');
+    end if;
+
+    l_title := 'Records: ' || l_topic;
+    page_start(l_title);
+    show_menu(l_title, 'data');
+    htp.p('<main class="wiki-main"><p>' || alink(topic_href(l_topic), 'Back to the document') || '</p>');
+    if l_id is not null then
+      htp.p('<div class="wiki-note">Records first entered on revision ' || l_id || '. '
+         || alink(c_data_url || '?p_topic=' || urlenc(l_topic), 'Show all records') || '</div>');
+    end if;
+    htp.p('<table class="wiki-grid"><tr><th>#</th><th>Created</th><th>By</th><th>Last changed</th><th>By</th></tr>');
+    for r in (select d.datasetid,
+                     min(d.dtcreated) created,
+                     max(d.whocreated) keep (dense_rank first order by d.dtcreated) whocreated,
+                     max(d.dtupdated) updated,
+                     max(d.whoupdated) keep (dense_rank last order by d.dtupdated) whoupdated
+                from ddg_wiki_data d
+                join ddg_wiki w on w.id = d.wikiid
+               where (l_id is not null and w.id = l_id)
+                  or (l_id is null and w.topic = l_topic)
+               group by d.datasetid
+               order by d.datasetid)
+    loop
+      l_n := l_n + 1;
+      htp.p('<tr><td>' || alink(c_url || '?p_topic=' || urlenc(l_topic) || '&p_datasetid=' || r.datasetid, to_char(l_n))
+         || '</td><td>' || fmt(r.created) || '</td><td>' || esc(safe_name(r.whocreated))
+         || '</td><td>' || fmt(r.updated) || '</td><td>' || esc(safe_name(r.whoupdated)) || '</td></tr>');
+    end loop;
+    htp.p('</table><p>' || case when l_n = 0 then 'No saved records.' else l_n || ' records.' end || '</p></main>');
+    footer;
+    page_end;
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end show_wiki_data;
+
+  procedure delete_wiki
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null) is
+    l_id     number := num(p_id);
+    l_topic  varchar2(200);
+    l_latest number;
+    l_owner  varchar2(30);
+    l_lock   varchar2(1);
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    require_post;
+    if l_id is not null then
+      begin
+        select topic into l_topic from ddg_wiki where id = l_id and deleted is null;
+      exception
+        when no_data_found then fail('That revision was already deleted.');
+      end;
+      if p_topic is not null and p_topic <> l_topic then
+        fail('Revision ' || l_id || ' does not belong to "' || p_topic || '".');
+      end if;
+    else
+      l_topic := p_topic;
+    end if;
+    l_latest := latest_id_exact(l_topic);
+    if l_latest is null then
+      fail('There is no document named "' || l_topic || '".');
+    end if;
+    select owner, ownerlock into l_owner, l_lock from ddg_wiki where id = l_latest;
+    if not can_edit_page(l_owner, l_lock) then
+      raise e_denied;
+    end if;
+
+    if l_id is not null then
+      update ddg_wiki set deleted = '1' where id = l_id;
+      if latest_id_exact(l_topic) is not null then
+        redirect(c_url || '?p_action=log&p_topic=' || urlenc(l_topic));
+        return;
+      end if;
+    else
+      update ddg_wiki set deleted = '1' where topic = l_topic and deleted is null;
+    end if;
+    redirect(c_url || '?p_action=list&p_topic=ByTitle');
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end delete_wiki;
+
+  procedure purge_wiki
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null) is
+    l_id    number := num(p_id);
+    l_moved number;
+    l_data  number;
+    l_rows  number;
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    if not is_admin then
+      raise e_denied;
+    end if;
+    require_post;
+
+    -- records saved on a deleted revision of a page that still exists move to its current revision
+    update ddg_wiki_data d
+       set d.wikiid = (select max(l.id)
+                         from ddg_wiki l
+                         join ddg_wiki x on x.topic = l.topic
+                        where x.id = d.wikiid
+                          and l.deleted is null)
+     where d.wikiid in (select id from ddg_wiki
+                         where deleted = '1'
+                           and (l_id is null or id = l_id)
+                           and (p_topic is null or topic = p_topic))
+       and exists (select 1
+                     from ddg_wiki l
+                     join ddg_wiki x on x.topic = l.topic
+                    where x.id = d.wikiid
+                      and l.deleted is null);
+    l_moved := sql%rowcount;
+
+    delete from ddg_wiki_data
+     where wikiid in (select id from ddg_wiki
+                       where deleted = '1'
+                         and (l_id is null or id = l_id)
+                         and (p_topic is null or topic = p_topic));
+    l_data := sql%rowcount;
+
+    delete from ddg_wiki
+     where deleted = '1'
+       and (l_id is null or id = l_id)
+       and (p_topic is null or topic = p_topic);
+    l_rows := sql%rowcount;
+
+    page_start('Purge');
+    show_menu('Purge deleted documents', 'purge');
+    htp.p('<main class="wiki-main"><div class="wiki-note">Removed ' || l_rows || ' deleted revisions and '
+       || l_data || ' record rows. ' || l_moved || ' record rows were kept by moving them to the current revision.</div>');
+    htp.p('<p>' || alink(c_url || '?p_action=list&p_topic=ByTitle', 'List of Documents') || '</p></main>');
+    page_end;
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end purge_wiki;
+
+  procedure rename_wiki
+    (p_topic_old in varchar2 default null
+    ,p_topic_new in varchar2 default null) is
+    l_old    varchar2(200) := substr(p_topic_old, 1, 200);
+    l_new    varchar2(200);
+    l_latest number;
+    l_owner  varchar2(30);
+    l_lock   varchar2(1);
+
+    procedure relink(p_from in varchar2, p_to in varchar2) is
+      l_pat varchar2(4000) := link_pattern(p_from);
+    begin
+      update ddg_wiki
+         set pageclob = regexp_replace(pageclob, l_pat, '[[' || replace(p_to, '\', '\\') || '\1', 1, 0, 'i')
+       where regexp_like(pageclob, l_pat, 'i');
+    end;
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    require_post;
+    l_latest := latest_id_exact(l_old);
+    if l_latest is null then
+      fail('There is no document named "' || l_old || '".');
+    end if;
+    select owner, ownerlock into l_owner, l_lock from ddg_wiki where id = l_latest;
+    if not can_edit_page(l_owner, l_lock) then
+      raise e_denied;
+    end if;
+    l_new := check_topic(p_topic_new);
+
+    if l_new <> l_old then
+      if find_latest_id(l_new) is not null and upper(l_new) <> upper(l_old) then
+        fail('A document named "' || l_new || '" already exists.');
+      end if;
+      update ddg_wiki set topic = l_new where topic = l_old;     -- all revisions, deleted ones too
+      relink(l_old, l_new);
+      if esc(l_old) <> l_old then
+        relink(esc(l_old), esc(l_new));                          -- links typed as HTML (Q&amp;A)
+      end if;
+    end if;
+    redirect(topic_href(l_new));
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end rename_wiki;
+
+  procedure email_form
+    (p_topic in varchar2 default null) is
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    if latest_id_exact(p_topic) is null then
+      fail('There is no document named "' || p_topic || '".');
+    end if;
+    page_start('Email ' || p_topic, null, 'wiki-popup');
+    htp.p('<main class="wiki-main"><h2>Email &ldquo;' || esc(p_topic) || '&rdquo;</h2>');
+    htp.p('<form method="post" action="' || c_email_url || '" class="wiki-email">');
+    hidden('p_topic', p_topic);
+    htp.p('<label>Send to<br><select name="p_emailto" required><option value=""></option>');
+    for r in (select userid, last_name || ', ' || first_name nm
+                from wiki_users
+               where active = '1'
+               order by 2)
+    loop
+      htp.p('<option value="' || esc(r.userid) || '"' || case when r.userid = g_user then ' selected' end
+         || '>' || esc(r.nm) || '</option>');
+    end loop;
+    htp.p('</select></label>');
+    htp.p('<label>Subject<br><input type="text" name="p_emailsubject" maxlength="80" size="50" value="'
+       || esc(p_topic) || '"></label>');
+    htp.p('<p><button type="submit">Send Email</button> <a href="#" data-wiki="close">Cancel</a></p></form></main>');
+    page_end;
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end email_form;
+
+  procedure email_wiki
+    (p_emailfrom    in varchar2   default null
+    ,p_emailto      in varchar2   default null
+    ,p_emailsubject in varchar2   default null
+    ,p_topic        in varchar2   default null
+    ,p_private      in varchar2   default null
+    ,p_emailbody    in owa.vc_arr default empty_vc_arr) is
+    l_latest number;
+    l_n      number;
+    l_clob   clob;
+    l_html   clob;
+    l_ok     boolean;
+    l_link   varchar2(4000);
+    l_body   varchar2(32767);
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    require_post;
+    l_latest := latest_id_exact(p_topic);
+    if l_latest is null then
+      fail('There is no document named "' || p_topic || '".');
+    end if;
+    select count(*) into l_n
+      from wiki_users
+     where userid = p_emailto
+       and active = '1';
+    if l_n = 0 then
+      fail('Choose who to send the email to.');
+    end if;
+
+    l_ok   := load_page(l_latest, l_clob);
+    l_link := site_url || topic_href(g_pg.topic);
+    l_body := '<p><a href="' || esc(l_link) || '">Open &ldquo;' || esc(g_pg.topic) || '&rdquo; in the wiki</a></p>';
+    l_html := render_links(l_clob, site_url);
+    if nvl(dbms_lob.getlength(l_html), 0) <= 28000 then
+      begin
+        l_body := l_body || '<hr>' || dbms_lob.substr(l_html, 28000, 1);
+      exception
+        when value_error then null;           -- too large once encoded: send just the link
+      end;
+    end if;
+    wiki_env.send_mail(g_user, p_emailto,
+                       substr(nvl(trim(p_emailsubject), g_pg.topic), 1, 80) || '-' || to_char(sysdate, 'MM/DD/YYYY'),
+                       l_body);
+
+    page_start('Email sent', null, 'wiki-popup');
+    htp.p('<main class="wiki-main"><p>Email sent to ' || esc(safe_name(p_emailto)) || '.</p>'
+       || '<p><button type="button" data-wiki="close">Close Window</button></p></main>');
+    page_end;
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end email_wiki;
+
+  procedure set_batch_user
+    (p_user     in varchar2
+    ,p_seclevel in number default 5) is
+  begin
+    if in_web then
+      raise_application_error(-20001, 'web_wiki.set_batch_user cannot be called through the web gateway');
+    end if;
+    g_batch_user  := p_user;
+    g_batch_level := p_seclevel;
+  end set_batch_user;
+
+  procedure wiki_js
+    (v in varchar2 default null) is
+  begin
+    owa_util.mime_header('text/javascript', false, 'UTF-8');
+    htp.p('Cache-Control: public, max-age=86400');
+    owa_util.http_header_close;
+    htp.prn(q'~/* web_wiki client script - served by web_wiki.wiki_js. No dependencies.
+   Browse mode: wires up a page form named "userform" and reloads saved records.
+   Edit mode:   contenteditable editor with toolbar, HTML source view, form builder. */
+(function () {
+  'use strict';
+
+  var cfg = {};
+  try {
+    var cfgEl = document.getElementById('wikiCfg');
+    if (cfgEl) { cfg = JSON.parse(cfgEl.textContent || '{}'); }
+  } catch (err) { cfg = {}; }
+  window.wikiCfg = cfg;
+  window.p_arg = (cfg.arg === undefined) ? null : cfg.arg;
+
+  function byId(id) { return document.getElementById(id); }
+  function toArray(x) { return Array.prototype.slice.call(x || []); }
+  function attr(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function addHidden(f, name, value) {
+    var i = document.createElement('input');
+    i.type = 'hidden'; i.name = name; i.value = (value == null) ? '' : value;
+    f.appendChild(i);
+    return i;
+  }
+
+  /* ---------- helpers kept for scripts written into wiki pages ---------- */
+  window.addField = function (form, type, name, value) {
+    var i = document.createElement('input');
+    i.type = type; i.name = name; i.value = (value == null) ? '' : value;
+    form.appendChild(i);
+    return i;
+  };
+  window.getField = function (form, name) {
+    return (form && form.elements) ? form.elements.namedItem(name) : null;
+  };
+  window.removeField = function (form, name) {
+    var f = window.getField(form, name);
+    if (f && f.nodeType === 1 && f.parentNode) { f.parentNode.removeChild(f); }
+  };
+  window.setField = function (form, name, value, concat) {
+    var f = window.getField(form, name);
+    if (!f) { return false; }
+    var list = (f.nodeType === 1) ? [f] : toArray(f);
+    list.forEach(function (e) {
+      var t = (e.type || '').toLowerCase();
+      if (t === 'checkbox' || t === 'radio') {
+        if (String(e.value) === String(value)) { e.checked = true; }
+      } else if (e.tagName === 'SELECT') {
+        toArray(e.options).forEach(function (o) { if (String(o.value) === String(value)) { o.selected = true; } });
+      } else {
+        e.value = concat ? e.value + value : value;
+      }
+    });
+    return true;
+  };
+  window.recheckcomma = function (field, value) {
+    if (!field) { return; }
+    var list = (field.nodeType === 1) ? [field] : toArray(field);
+    var wanted = ',' + value + ',';
+    list.forEach(function (e) {
+      if (e.type === 'radio' || e.type === 'checkbox') {
+        if (wanted.indexOf(',' + e.value + ',') >= 0) { e.checked = true; }
+      }
+    });
+  };
+
+  /* ---------- browse mode: page forms ---------- */
+  function fillForm(f, data) {
+    Object.keys(data).forEach(function (name) {
+      var vals = data[name] || [];
+      var els = toArray(f.elements).filter(function (e) { return e.name === name; });
+      var checkable = els.filter(function (e) { return e.type === 'checkbox' || e.type === 'radio'; });
+      // records saved by the old engine kept checkbox groups as "a,b,c"
+      if (checkable.length > 1 && vals.length === 1 && vals[0].indexOf(',') >= 0) {
+        vals = vals[0].split(',');
+      }
+      var idx = 0;
+      els.forEach(function (e) {
+        var t = (e.type || '').toLowerCase();
+        if (t === 'checkbox' || t === 'radio') {
+          e.checked = vals.indexOf(e.value) >= 0;
+        } else if (t === 'select-multiple') {
+          toArray(e.options).forEach(function (o) { o.selected = vals.indexOf(o.value) >= 0; });
+        } else if (t === 'submit' || t === 'button' || t === 'reset' || t === 'image' || t === 'file') {
+          return;
+        } else {
+          if (idx < vals.length) { e.value = vals[idx]; }
+          idx++;
+        }
+      });
+    });
+  }
+
+  function setupUserForm() {
+    var f = document.forms.userform;
+    if (f && !f.elements && f.length) { f = f[0]; }
+    if (!f || !f.elements) { return; }
+    if (f.getAttribute('action')) { return; }          // page supplied its own handler
+    f.method = 'post';
+    f.action = cfg.saveUrl;
+    addHidden(f, 'WIKIID', cfg.wikiId || '');
+    addHidden(f, 'WIKIDATASETID', cfg.datasetId || '');
+    var table = f.getAttribute('dbtable');
+    if (table) {
+      addHidden(f, '_DBTABLE', table);
+      if (f.getAttribute('dbpk')) { addHidden(f, '_DBPK', f.getAttribute('dbpk')); }
+    }
+    var prev = f.onsubmit;
+    f.onsubmit = function (ev) {
+      if (prev && prev.call(f, ev) === false) { return false; }
+      if (typeof window.valforms === 'function' && window.valforms(f) === false) { return false; }
+      return true;
+    };
+    if (cfg.data) { fillForm(f, cfg.data); }
+  }
+
+  window.addEventListener('load', function () {
+    if (typeof window.useronload === 'function') {
+      try { window.useronload(); } catch (e) { if (window.console) { console.error(e); } }
+    }
+    if (cfg.mode === 'browse') { setupUserForm(); }
+    if (cfg.mode === 'edit') { initEditor(); }
+  });
+
+  /* ---------- links and buttons shared by every page ---------- */
+  document.addEventListener('click', function (e) {
+    var el = (e.target && e.target.closest) ? e.target.closest('[data-wiki]') : null;
+    if (!el) { return; }
+    var act = el.getAttribute('data-wiki');
+    if (act === 'new') {
+      e.preventDefault();
+      var nm = window.prompt('Name of the new document:', '');
+      if (nm && nm.trim()) {
+        location.href = cfg.url + '?p_action=edit&p_topic=' + encodeURIComponent(nm.trim());
+      }
+    } else if (act === 'popup') {
+      e.preventDefault();
+      window.open(el.href, 'wikipopup', 'width=640,height=400,resizable=1,scrollbars=1');
+    } else if (act === 'close') {
+      e.preventDefault();
+      window.close();
+    } else if (act === 'print') {
+      e.preventDefault();
+      window.print();
+    }
+  });
+
+  document.addEventListener('submit', function (e) {
+    var f = e.target;
+    var act = f.getAttribute ? f.getAttribute('data-wiki') : null;
+    if (act === 'rename') {
+~');
+    htp.prn(q'~      var old = f.elements.p_topic_old.value;
+      var nm = window.prompt('Rename "' + old + '" to:', old);
+      if (!nm || !nm.trim() || nm.trim() === old) { e.preventDefault(); return; }
+      f.elements.p_topic_new.value = nm.trim();
+    } else if (act === 'confirm') {
+      if (!window.confirm(f.getAttribute('data-msg') || 'Are you sure?')) { e.preventDefault(); }
+    }
+  });
+
+  /* ---------- edit mode ---------- */
+  function panel(title, html) {
+    var wrap = document.createElement('div');
+    wrap.className = 'wiki-panel';
+    wrap.innerHTML = '<div role="dialog" aria-label="' + attr(title) + '"><p style="text-align:right">' +
+      '<button type="button" data-close="1">Close</button></p><h2>' + attr(title) + '</h2>' + html + '</div>';
+    wrap.addEventListener('click', function (e) {
+      if (e.target === wrap || (e.target.getAttribute && e.target.getAttribute('data-close'))) {
+        document.body.removeChild(wrap);
+      }
+    });
+    document.body.appendChild(wrap);
+  }
+
+  // split text into chunks without cutting a surrogate pair in half
+  function chunks(text, size) {
+    var out = [], i = 0;
+    while (i < text.length) {
+      var end = Math.min(i + size, text.length);
+      var code = text.charCodeAt(end - 1);
+      if (end < text.length && code >= 0xD800 && code <= 0xDBFF) { end--; }
+      out.push(text.substring(i, end));
+      i = end;
+    }
+    return out;
+  }
+  window.wikiChunks = chunks;
+
+  function initEditor() {
+    var ed = byId('wikiEditor'), src = byId('wikiSource'), bar = byId('wikiToolbar'), form = byId('wikiSaveForm');
+    if (!ed || !src || !form) { return; }
+    var srcMode = false, dirty = false, saved = null, lastBtn = null;
+
+    ed.innerHTML = src.value;
+    try { document.execCommand('defaultParagraphSeparator', false, 'p'); } catch (x) { /* older browsers */ }
+
+    function inEditor(node) { return !!node && (node === ed || ed.contains(node)); }
+    function closestIn(node, tag) {
+      while (node && node !== ed) {
+        if (node.nodeType === 1 && node.tagName === tag) { return node; }
+        node = node.parentNode;
+      }
+      return null;
+    }
+    document.addEventListener('selectionchange', function () {
+      var s = window.getSelection();
+      if (s && s.rangeCount && inEditor(s.getRangeAt(0).commonAncestorContainer)) {
+        saved = s.getRangeAt(0).cloneRange();
+      }
+    });
+    function restore() {
+      ed.focus();
+      if (!saved || !inEditor(saved.commonAncestorContainer)) {
+        saved = document.createRange();
+        saved.selectNodeContents(ed);
+        saved.collapse(false);
+      }
+      var s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(saved);
+    }
+    function exec(cmd, val) {
+      restore();
+      document.execCommand(cmd, false, (val === undefined) ? null : val);
+      dirty = true;
+    }
+    function insert(html) { exec('insertHTML', html); }
+    function selText() { return saved ? saved.toString() : ''; }
+    function caretForm() { return saved ? closestIn(saved.startContainer, 'FORM') : null; }
+
+    // Clicking controls inside the page being edited must not submit or navigate.
+    ed.addEventListener('submit', function (e) { e.preventDefault(); }, true);
+    ed.addEventListener('click', function (e) {
+      var t = e.target;
+      if (t.tagName === 'BUTTON' || (t.tagName === 'INPUT' && /^(submit|button|reset|image)$/i.test(t.type))) {
+        e.preventDefault();
+      }
+    });
+    ed.addEventListener('input', function () { dirty = true; });
+    src.addEventListener('input', function () { dirty = true; });
+
+    var colors = [['', 'Color'], ['black', 'Black'], ['gray', 'Gray'], ['maroon', 'Maroon'], ['red', 'Red'],
+      ['green', 'Green'], ['blue', 'Blue'], ['navy', 'Navy'], ['purple', 'Purple'], ['teal', 'Teal'], ['orange', 'Orange']];
+    var hilites = [['', 'Highlight'], ['yellow', 'Yellow'], ['aqua', 'Aqua'], ['lime', 'Lime'], ['pink', 'Pink'],
+      ['silver', 'Silver'], ['white', 'None (white)']];
+    var items = [
+      { cmd: 'undo', label: '&#8630;', title: 'Undo' },
+      { cmd: 'redo', label: '&#8631;', title: 'Redo' },
+      '|',
+      { select: 'formatBlock', title: 'Paragraph style', options: [['', 'Style'], ['P', 'Normal'], ['H1', 'Heading 1'],
+        ['H2', 'Heading 2'], ['H3', 'Heading 3'], ['PRE', 'Preformatted'], ['BLOCKQUOTE', 'Quote']] },
+      { select: 'fontName', title: 'Font', options: [['', 'Font'], ['Arial', 'Arial'], ['Courier New', 'Courier'],
+        ['Georgia', 'Georgia'], ['Tahoma', 'Tahoma'], ['Times New Roman', 'Times'], ['Verdana', 'Verdana']] },
+      { select: 'fontSize', title: 'Font size', options: [['', 'Size'], ['1', 'Smallest'], ['2', 'Small'], ['3', 'Medium'],
+        ['4', 'Large'], ['5', 'Larger'], ['6', 'Largest']] },
+      { select: 'foreColor', title: 'Text color', options: colors },
+      { select: 'hiliteColor', title: 'Highlight color', options: hilites },
+      '|',
+      { cmd: 'bold', label: '<b>B</b>', title: 'Bold (Ctrl+B)' },
+      { cmd: 'italic', label: '<i>I</i>', title: 'Italic (Ctrl+I)' },
+      { cmd: 'underline', label: '<u>U</u>', title: 'Underline (Ctrl+U)' },
+      { cmd: 'strikeThrough', label: '<s>S</s>', title: 'Strikethrough' },
+      { cmd: 'removeFormat', label: 'T&#824;', title: 'Clear formatting' },
+      '|',
+      { cmd: 'justifyLeft', label: '&#8676;', title: 'Align left' },
+      { cmd: 'justifyCenter', label: '&#8596;', title: 'Center' },
+      { cmd: 'justifyRight', label: '&#8677;', title: 'Align right' },
+      '|',
+      { cmd: 'insertUnorderedList', label: '&bull; List', title: 'Bulleted list' },
+      { cmd: 'insertOrderedList', label: '1. List', title: 'Numbered list' },
+      { cmd: 'outdent', label: '&#8676;&#8202;&#9776;', title: 'Outdent' },
+      { cmd: 'indent', label: '&#9776;&#8202;&#8677;', title: 'Indent' },
+      '|',
+      { cmd: 'link', label: 'Link', title: 'Create or change a web link' },
+      { cmd: 'unlink', label: 'Unlink', title: 'Remove link' },
+~');
+    htp.prn(q'~      { cmd: 'wikilink', label: '[[&nbsp;]]', title: 'Link to another wiki document' },
+      { cmd: 'image', label: 'Image', title: 'Insert image' },
+      { cmd: 'table', label: 'Table', title: 'Insert table' },
+      { cmd: 'insertHorizontalRule', label: '&#8213;', title: 'Horizontal rule' },
+      '|',
+      { select: 'form', title: 'Form elements', options: [['', 'Form...'], ['userform', 'Insert form'],
+        ['dbform', 'Insert database form'], ['text', 'Text box'], ['textarea', 'Text area'], ['checkbox', 'Checkbox'],
+        ['radio', 'Radio buttons'], ['select', 'Dropdown'], ['date', 'Date'], ['hidden', 'Hidden value'],
+        ['submit', 'Submit button']] },
+      { cmd: 'forminfo', label: 'Form info', title: 'List the named form elements on this page' },
+      '|',
+      { cmd: 'source', label: 'HTML', title: 'Switch between WYSIWYG and HTML source', keep: true }
+    ];
+
+    items.forEach(function (it) {
+      if (it === '|') {
+        var s = document.createElement('span');
+        s.className = 'wiki-sep';
+        bar.appendChild(s);
+        return;
+      }
+      if (it.select) {
+        var sel = document.createElement('select');
+        sel.title = it.title;
+        it.options.forEach(function (o) {
+          var op = document.createElement('option');
+          op.value = o[0]; op.textContent = o[1];
+          sel.appendChild(op);
+        });
+        sel.addEventListener('change', function () {
+          var v = sel.value;
+          sel.selectedIndex = 0;
+          if (v) { run(it.select, v); }
+        });
+        bar.appendChild(sel);
+        return;
+      }
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.innerHTML = it.label;
+      b.title = it.title;
+      b.setAttribute('aria-label', it.title);
+      if (it.keep) { b.setAttribute('data-keep', '1'); }
+      b.addEventListener('mousedown', function (e) { e.preventDefault(); });   // keep the text selection
+      b.addEventListener('click', function () { run(it.cmd); });
+      bar.appendChild(b);
+    });
+
+    function run(cmd, v) {
+      switch (cmd) {
+        case 'source': toggleSource(); break;
+        case 'formatBlock': exec('formatBlock', '<' + v + '>'); break;
+        case 'hiliteColor': hilite(v); break;
+        case 'link': askLink(); break;
+        case 'wikilink': wikiLink(); break;
+        case 'image': askImage(); break;
+        case 'table': insertTable(); break;
+        case 'forminfo': formInfo(); break;
+        case 'form': insertFormItem(v); break;
+        default: exec(cmd, v);
+      }
+    }
+    function hilite(v) {
+      restore();
+      try { document.execCommand('styleWithCSS', false, true); } catch (x) { /* ignore */ }
+      document.execCommand('hiliteColor', false, v);
+      try { document.execCommand('styleWithCSS', false, false); } catch (x) { /* ignore */ }
+      dirty = true;
+    }
+    function askLink() {
+      var u = window.prompt('Link address:', 'https://');
+      if (u && u !== 'https://') { exec('createLink', u); }
+    }
+    function wikiLink() {
+      var t = window.prompt('Link to wiki document:', selText().trim());
+      if (t && t.trim()) { exec('insertText', '[[' + t.trim() + ']]'); }
+    }
+    function askImage() {
+      var u = window.prompt('Image address (URL):', '');
+      if (u) { exec('insertImage', u); }
+    }
+    function insertTable() {
+      var spec = window.prompt('Table size (rows x columns):', '3 x 3');
+      if (!spec) { return; }
+      var m = /(\d+)\D+(\d+)/.exec(spec);
+      if (!m) { window.alert('Enter the size like 3 x 4'); return; }
+      var rows = Math.min(+m[1], 200), cols = Math.min(+m[2], 30);
+      var h = '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse">';
+      for (var r = 0; r < rows; r++) {
+        h += '<tr>';
+        for (var c = 0; c < cols; c++) { h += '<td>&nbsp;</td>'; }
+        h += '</tr>';
+      }
+      insert(h + '</table><p><br></p>');
+    }
+    function insertFormItem(kind) {
+      var html = '';
+      if (kind === 'userform' || kind === 'dbform') {
+        if (ed.querySelector('form[name="userform"]')) {
+          window.alert('This document already has a form. Put new fields inside it.');
+          return;
+        }
+        var extra = '', hint = 'Add fields here.';
+        if (kind === 'dbform') {
+          var tb = window.prompt('Database table this form saves to:', '');
+          if (!tb || !tb.trim()) { return; }
+          var pk = window.prompt('Primary key column of ' + tb.trim() + ':', '');
+          if (!pk || !pk.trim()) { return; }
+          extra = ' dbtable="' + attr(tb.trim().toUpperCase()) + '" dbpk="' + attr(pk.trim().toUpperCase()) + '"';
+          hint = 'Name each field DB_COLUMN (DBDT_COLUMN for dates).';
+        }
+        insert('<form name="userform"' + extra + '><p>' + hint + '</p><p><input type="submit" value="Save"></p></form><p><br></p>');
+        return;
+      }
+      var inForm = caretForm();
+      if (ed.querySelector('form') && !inForm &&
+          !window.confirm('The cursor is not inside the form, so this field will not be saved. Insert it anyway?')) {
+        return;
+      }
+      if (kind === 'submit') {
+        var label = window.prompt('Button text:', 'Save');
+        if (label) { insert('<input type="submit" value="' + attr(label) + '">&nbsp;'); }
+        return;
+      }
+      var dbHint = (inForm && inForm.getAttribute('dbtable')) ? ' (DB_COLUMN, or DBDT_COLUMN for dates)' : '';
+      var name = window.prompt('Field name' + dbHint + ':', '');
+      if (!name || !name.trim()) { return; }
+      name = attr(name.trim());
+      if (kind === 'text') {
+        html = '<input type="text" name="' + name + '" size="30">';
+      } else if (kind === 'textarea') {
+        html = '<textarea name="' + name + '" rows="4" cols="50"></textarea>';
+      } else if (kind === 'date') {
+        html = '<input type="date" name="' + name + '">';
+      } else if (kind === 'hidden') {
+~');
+    htp.prn(q'~        html = '<input type="hidden" name="' + name + '" value="' + attr(window.prompt('Value:', '') || '') + '">';
+      } else if (kind === 'checkbox') {
+        html = '<label><input type="checkbox" name="' + name + '" value="Y"> ' +
+          attr(window.prompt('Label shown next to the checkbox:', '') || '') + '</label>';
+      } else if (kind === 'radio' || kind === 'select') {
+        var opts = (window.prompt('Choices, separated by commas:', 'Yes, No') || '')
+          .split(',').map(function (o) { return o.trim(); }).filter(Boolean);
+        if (!opts.length) { return; }
+        if (kind === 'radio') {
+          html = opts.map(function (o) {
+            return '<label><input type="radio" name="' + name + '" value="' + attr(o) + '"> ' + attr(o) + '</label>';
+          }).join(' ');
+        } else {
+          html = '<select name="' + name + '"><option value=""></option>' + opts.map(function (o) {
+            return '<option value="' + attr(o) + '">' + attr(o) + '</option>';
+          }).join('') + '</select>';
+        }
+      }
+      if (html) { insert(html + '&nbsp;'); }
+    }
+    function formInfo() {
+      var forms = ed.querySelectorAll('form'), h = '';
+      if (!forms.length) { h = '<p>This document has no forms.</p>'; }
+      toArray(forms).forEach(function (f, k) {
+        var nm = f.getAttribute('name'), tb = f.getAttribute('dbtable');
+        h += '<h3>Form ' + (k + 1) + (nm ? ': ' + attr(nm) : '') +
+          (tb ? ' &rarr; table ' + attr(tb) + ' (key ' + attr(f.getAttribute('dbpk') || '?') + ')' : '') + '</h3>';
+        h += '<table class="wiki-grid"><tr><th>#</th><th>Type</th><th>Name</th><th>Value</th></tr>';
+        toArray(f.querySelectorAll('input,select,textarea,button')).forEach(function (el, i) {
+          h += '<tr><td>' + (i + 1) + '</td><td>' + attr(el.type || el.tagName.toLowerCase()) + '</td><td>' +
+            attr(el.getAttribute('name') || '') + '</td><td>' + attr(el.getAttribute('value') || '') + '</td></tr>';
+        });
+        h += '</table>';
+      });
+      if (forms.length && !ed.querySelector('form[name="userform"]')) {
+        h += '<p><b>Note:</b> only a form named <code>userform</code> is saved by the wiki.</p>';
+      }
+      panel('Form elements', h);
+    }
+    function setBarDisabled(off) {
+      toArray(bar.querySelectorAll('button,select')).forEach(function (c) {
+        if (!c.getAttribute('data-keep')) { c.disabled = off; }
+      });
+    }
+    function toggleSource() {
+      if (srcMode) {
+        ed.innerHTML = src.value;
+        src.hidden = true; ed.hidden = false; srcMode = false;
+        setBarDisabled(false);
+        ed.focus();
+      } else {
+        src.value = ed.innerHTML;
+        src.hidden = false; ed.hidden = true; srcMode = true;
+        setBarDisabled(true);
+        src.focus();
+      }
+    }
+
+    form.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[type=submit]') : null;
+      if (b) { lastBtn = b; }
+    });
+    form.addEventListener('submit', function (e) {
+      var btn = e.submitter || lastBtn;
+      if (btn && btn.value === 'Save As') {
+        var nm = window.prompt('Save as a new document named:', cfg.topic || '');
+        if (!nm || !nm.trim()) { e.preventDefault(); return; }
+        form.elements.p_topic_new.value = nm.trim();
+      }
+      var html = srcMode ? src.value : ed.innerHTML;
+      toArray(form.querySelectorAll('input[name="p_data"]')).forEach(function (n) { n.parentNode.removeChild(n); });
+      var parts = chunks(html, 8000);
+      while (parts.length < 2) { parts.push(''); }   // gateway needs an array, so always send 2+
+      parts.forEach(function (p) { addHidden(form, 'p_data', p); });
+      dirty = false;
+    });
+    document.addEventListener('keydown', function (e) {
+      if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        var save = form.querySelector('button[value="Save"]');
+        if (form.requestSubmit) { form.requestSubmit(save); } else { save.click(); }
+      }
+    });
+    window.addEventListener('beforeunload', function (e) {
+      if (dirty) { e.preventDefault(); e.returnValue = ''; }
+    });
+  }
+})();
+~');
+  end wiki_js;
+
+end web_wiki;
+/
+show errors
