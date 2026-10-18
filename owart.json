@@ -20,6 +20,15 @@
       "db": ":memory:",
       "install": ["appdoc/install.sql", "appdoc/northwind-harvest.sql", "appdoc/northwind-docs.sql"],
       "default_page": "appdoc.home"
+    },
+    {
+      "name": "wiki",
+      "title": "Wiki",
+      "description": "A wiki engine: pages with history, links, search and a WYSIWYG editor, page forms whose answers are kept as records, and database forms that write to an allowed table.",
+      "db": ":memory:",
+      "install": ["wiki/web_wiki.ddl", "wiki/wiki_env.sql", "wiki/web_wiki.pkg", "wiki/pages.sql"],
+      "default_page": "web_wiki.show_wiki",
+      "request_validation_function": "wiki_env.allowed"
     }
   ]
 }

@@ -1,6 +1,6 @@
 # PL/SQL Web Toolkit samples
 
-Two applications written the way mod_plsql applications are: PL/SQL packages that write
+Three applications written the way mod_plsql applications are: PL/SQL packages that write
 their pages with `HTP`, forms that post back to a procedure, and a redirect after a save.
 They run on your own computer with no Oracle Database. [sqling](https://sqling.com)'s
 PL/SQL gateway runs the PL/SQL, and the data lives in SQLite.
@@ -9,9 +9,10 @@ PL/SQL gateway runs the PL/SQL, and the data lives in SQLite.
 |---|---|
 | [`hr/`](hr/install.sql) | Departments and employees: list, edit, save, delete; file upload and download; a CSV export. |
 | [`appdoc/`](appdoc/install.sql) | **AppDoc**: technical documentation and user help kept by application, with the Northwind Traders forms documented as its example. |
+| [`wiki/`](wiki/README.md) | **Wiki**: pages with history, links, search and a WYSIWYG editor; page forms whose answers are kept as records, and database forms that write to a table. |
 
-Both are also live demos on sqling Pro (sign-in required):
-[HR](https://sqling.com/pro/owart/hr/) · [AppDoc](https://sqling.com/pro/owart/appdoc/).
+All three are also live demos on sqling Pro (sign-in required):
+[HR](https://sqling.com/pro/owart/hr/) · [AppDoc](https://sqling.com/pro/owart/appdoc/) · [Wiki](https://sqling.com/pro/owart/wiki/).
 
 ## Run them on your computer
 
@@ -34,10 +35,11 @@ python3 -m venv .venv
 
 On Windows, use `py -3 -m venv .venv`, `.venv\Scripts\pip install ...` and `.venv\Scripts\owart --config owart.json`.
 
-Open <http://127.0.0.1:8800/>. It lists both samples:
+Open <http://127.0.0.1:8800/>. It lists the samples:
 
 - <http://127.0.0.1:8800/hr/>: the departments; click one to see and edit its employees.
 - <http://127.0.0.1:8800/appdoc/>: the applications documented; open **Northwind Traders**.
+- <http://127.0.0.1:8800/wiki/>: the wiki's Home page; sign in as someone else from the link there.
 
 Press Ctrl-C in the terminal to stop.
 
@@ -70,6 +72,7 @@ Each sample is a **DAD** in `owart.json`, as in mod_plsql:
 | `default_page` | the procedure `/<name>/` opens |
 | `document_table`, `document_path`, `document_procedure` | mod_plsql's document settings: where uploads go and how `/<name>/docs/...` downloads are served |
 | `max_upload` | the largest upload, in bytes |
+| `request_validation_function` | a PL/SQL function asked, before every call, whether a procedure may be called from a URL (ORDS's and mod_plsql's setting of the same name) |
 
 At the top level, `port` (8800) and `host` (127.0.0.1) say where the gateway listens.
 
@@ -118,10 +121,37 @@ To document an application of your own, harvest its database and add the script 
 .venv/bin/owart-harvest myapp.sqlite --app MYAPP --name "My application" -o myapp-docs.sql
 ```
 
+## Wiki
+
+A wiki engine by Dan Bailey (2007; rewritten 2026) in one package, `web_wiki`, with its editor's
+script served by the package itself:
+
+- **Pages:** every save is a revision, with history, restore, rename (links to the page follow it),
+  delete and purge; `[[Page]]` links, search, and the pages that link to a page.
+- **Editor:** a WYSIWYG editor with an HTML view and a form builder; no libraries.
+- **Page forms:** a form named `userform` on a page keeps each Save as a record of the page, which
+  can be opened again and changed.
+- **Database forms:** fields named after a table's columns insert or update that table, if it is
+  listed in `DDG_WIKI_FORM_TABLES`.
+- **Who may do what:** security levels, owner locks, and POST-only, same-site changes.
+
+The wiki was written inside a larger application, which said who is signed in, how much they may
+do, what people are called, and sent mail. Those are the package `wiki_env` here, over a table of
+users, so the wiki runs on its own; [`wiki/README.md`](wiki/README.md) says what to replace for a
+real installation.
+
+| File | |
+|---|---|
+| `wiki/web_wiki.ddl` | the tables, sequences, triggers, and the WikiHelp page |
+| `wiki/wiki_env.sql` | the application around the wiki: users, sign-in, names, mail (kept in an outbox) |
+| `wiki/web_wiki.pkg` | the engine |
+| `wiki/pages.sql` | starter pages: links, a page form, a database form, a page script and a locked page |
+
 ## On Oracle too
 
 These are standard PL/SQL Web Toolkit applications, so they also run on Oracle's own
-gateway, mod_plsql or ORDS. Both compile and run on Oracle Database 23ai. To use them there:
+gateway, mod_plsql or ORDS. All three compile and run on Oracle Database 23ai (the wiki on 12.2
+or later). To use them there:
 - **Loading:** load the scripts into a schema with SQL*Plus or SQLcl.
 - **DADs:** point a DAD at the schema with the same default pages.
 - **HR's document table:** create `HR_DOCS` with mod_plsql's standard columns (`NAME`, `MIME_TYPE`, `DOC_SIZE`, `DAD_CHARSET`, `LAST_UPDATED`, `CONTENT_TYPE`, `BLOB_CONTENT`).
