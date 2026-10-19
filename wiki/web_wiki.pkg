@@ -10,7 +10,7 @@ set define off
 --
 -- Gateway allow-list (ORDS: ords_admin / PlsqlRequestValidationFunction): expose only
 --   web_wiki.show_wiki, show_wiki_data, saveformdata, delete_wiki, rename_wiki,
---   purge_wiki, email_form, email_wiki, wiki_js, export_page, export_data  (wiki_env.allowed does it here)
+--   purge_wiki, email_form, email_wiki, wiki_js, export_page, export_data, export_wiki  (wiki_env.allowed does it here)
 -- set_batch_user refuses to run inside a web request, but it should not be listed either.
 ------------------------------------------------------------------------------
 create or replace package web_wiki is
@@ -88,6 +88,12 @@ create or replace package web_wiki is
     (p_id    in varchar2 default null
     ,p_topic in varchar2 default null);
 
+  -- The whole wiki as a SQL script that loads it into another wiki (administrators).
+  -- Current revisions only, or every one (p_history = Y); records too with p_records = Y.
+  procedure export_wiki
+    (p_history in varchar2 default null
+    ,p_records in varchar2 default null);
+
   -- For PL/SQL batch jobs that call saveformdata etc. outside a web request.
   -- Raises an error if called through the web gateway.
   procedure set_batch_user
@@ -128,6 +134,7 @@ create or replace package body web_wiki is
   c_js_url     constant varchar2(200) := c_base || 'web_wiki.wiki_js?v=20261017';
   c_export_url constant varchar2(200) := c_base || 'web_wiki.export_page';
   c_csv_url    constant varchar2(200) := c_base || 'web_wiki.export_data';
+  c_wiki_url   constant varchar2(200) := c_base || 'web_wiki.export_wiki';
 
   c_app_title  constant varchar2(40)  := 'Wiki';
   c_home       constant varchar2(80)  := 'Home';
@@ -1185,6 +1192,10 @@ create or replace package body web_wiki is
       post_button(c_purge_url, 'Purge deleted documents',
                   'Permanently remove every deleted revision (and records of deleted documents)? This cannot be undone.',
                   'p_topic', null);
+      htp.p('<p class="wiki-small">Export the wiki as a SQL script, to load into another wiki: '
+         || alink(c_wiki_url, 'current pages', 'The current revision of every document')
+         || ' &middot; ' || alink(c_wiki_url || '?p_history=Y&p_records=Y', 'everything',
+                                  'Every revision, and the form records') || '</p>');
     end if;
     htp.p('</main>');
     footer;
@@ -2073,6 +2084,138 @@ create or replace package body web_wiki is
     when e_denied then undo; report('DENIED');
     when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
   end export_data;
+
+  procedure export_wiki
+    (p_history in varchar2 default null
+    ,p_records in varchar2 default null) is
+    l_history varchar2(1) := case when upper(p_history) = 'Y' then 'Y' else 'N' end;
+    l_records boolean := upper(p_records) = 'Y';
+    l_pages   pls_integer := 0;
+    l_revs    pls_integer := 0;
+    l_sets    pls_integer := 0;
+
+    procedure line(p in varchar2) is
+    begin
+      htp.prn(p || chr(10));
+    end;
+
+    -- A value as SQL text. Quotes doubled; a line break is chr(10) and the script's own
+    -- line breaks there, so every line of page text starts inside a string -- never with
+    -- the / or @ that SQL*Plus would act on.
+    function lit(p in varchar2) return varchar2 is
+    begin
+      if p is null then
+        return 'null';
+      end if;
+      return '''' || replace(replace(replace(p, '''', ''''''), chr(13), '''||chr(13)||'''),
+                             chr(10), '''||chr(10)||' || chr(10) || '''') || '''';
+    end;
+
+    function dlit(d in date) return varchar2 is
+    begin
+      return case when d is null then 'null'
+                  else 'to_date(''' || to_char(d, 'YYYY-MM-DD HH24:MI:SS') || ''', ''YYYY-MM-DD HH24:MI:SS'')' end;
+    end;
+
+    -- page text in pieces of 1000 characters: no line of the script near SQL*Plus's limit
+    procedure clob_lines(c in clob) is
+      l_len number := nvl(dbms_lob.getlength(c), 0);
+      l_off number := 1;
+    begin
+      line('  c := null;');
+      while l_off <= l_len loop
+        line('  c := c || ' || lit(dbms_lob.substr(c, 1000, l_off)) || ';');
+        l_off := l_off + 1000;
+      end loop;
+    end;
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    if not is_admin then
+      raise e_denied;
+    end if;
+
+    download_header('application/sql', 'wiki-' || to_char(sysdate, 'YYYYMMDD') || '.sql');
+    line('set define off');
+    line('-- The wiki at ' || site_url || c_url || ', exported ' || to_char(sysdate, 'YYYY-MM-DD HH24:MI')
+      || ' by ' || g_user || ' (' || c_version || ').');
+    line('-- ' || case when l_history = 'Y' then 'Every revision' else 'The current revision' end
+      || ' of each document' || case when l_records then ', and the form records' end || '.');
+    line('-- Run it in the schema of another wiki (SQL*Plus, SQLcl, SQL Developer). A document of the');
+    line('-- same name there gets these as new revisions on top, so nothing is overwritten.');
+    line('');
+
+    for t in (select topic, max(id) latest
+                from ddg_wiki
+               where deleted is null
+               group by topic
+               order by upper(topic))
+    loop
+      l_pages := l_pages + 1;
+      line('-- ' || t.topic);
+      line('declare');
+      line('  type t_map is table of number index by pls_integer;');
+      line('  m t_map;');
+      line('  c clob;');
+      line('  s number;');
+      line('  w number;');
+      line('begin');
+      for r in (select id, lasteditor, owner, ownerlock, excludesearch, lastupdate, creation, pageclob
+                  from ddg_wiki
+                 where topic = t.topic
+                   and deleted is null
+                   and (l_history = 'Y' or id = t.latest)
+                 order by id)
+      loop
+        l_revs := l_revs + 1;
+        clob_lines(r.pageclob);
+        line('  insert into ddg_wiki (topic, lasteditor, owner, ownerlock, excludesearch, creation, pageclob)');
+        line('  values (' || lit(t.topic) || ', ' || lit(r.lasteditor) || ', ' || lit(r.owner) || ', '
+          || lit(r.ownerlock) || ', ' || lit(r.excludesearch) || ', ' || dlit(r.creation) || ', c)');
+        line('  returning id into w;');
+        line('  m(' || r.id || ') := w;');
+        -- the insert trigger stamps the time; the revision keeps the time it was saved
+        line('  update ddg_wiki set lastupdate = ' || dlit(r.lastupdate) || ' where id = w;');
+      end loop;
+
+      if l_records then
+        for d in (select distinct dd.datasetid
+                    from ddg_wiki_data dd
+                    join ddg_wiki w on w.id = dd.wikiid
+                   where w.topic = t.topic
+                   order by 1)
+        loop
+          l_sets := l_sets + 1;
+          line('  s := ddg_wiki_data_set_seq.nextval;');
+          for v in (select wikiid, fieldname, valno, seq, fieldvalue, dtcreated, dtupdated, whocreated, whoupdated
+                      from ddg_wiki_data
+                     where datasetid = d.datasetid
+                       and wikiid = (select max(x.wikiid) from ddg_wiki_data x where x.datasetid = d.datasetid)
+                     order by fieldname, valno, seq)
+          loop
+            -- the revision the record was saved on, or the current one when that is not exported
+            line('  w := case when m.exists(' || v.wikiid || ') then m(' || v.wikiid || ') else m(' || t.latest || ') end;');
+            line('  insert into ddg_wiki_data (datasetid, wikiid, fieldname, valno, seq, fieldvalue,'
+              || ' dtcreated, dtupdated, whocreated, whoupdated)');
+            line('  values (s, w, ' || lit(v.fieldname) || ', ' || v.valno || ', ' || v.seq || ', '
+              || lit(v.fieldvalue) || ', ' || dlit(v.dtcreated) || ', ' || dlit(v.dtupdated) || ', '
+              || lit(v.whocreated) || ', ' || lit(v.whoupdated) || ');');
+          end loop;
+        end loop;
+      end if;
+      line('end;');
+      line('/');
+      line('');
+    end loop;
+    line('commit;');
+    line('-- ' || l_pages || ' documents, ' || l_revs || ' revisions'
+      || case when l_records then ', ' || l_sets || ' records' end || '.');
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end export_wiki;
 
   procedure set_batch_user
     (p_user     in varchar2
