@@ -134,8 +134,9 @@ script served by the package itself:
 - **Database forms:** fields named after a table's columns insert or update that table, if it is
   listed in `DDG_WIKI_FORM_TABLES`.
 - **Who may do what:** security levels, owner locks, and POST-only, same-site changes.
-- **Export:** a page as a standalone HTML file, a page's records as CSV, and the whole wiki as
-  a SQL script that loads it into another wiki (or restores it).
+- **Export:** a page as a standalone HTML file, a page's records as CSV, the whole wiki as a SQL
+  script that loads it into another wiki (or restores it), and the whole wiki as web pages in a
+  `.zip` to read offline -- the zip written in PL/SQL with UTL_COMPRESS and UTL_RAW.
 
 The wiki was written inside a larger application, which said who is signed in, how much they may
 do, what people are called, and sent mail. Those are the package `wiki_env` here, over a table of
