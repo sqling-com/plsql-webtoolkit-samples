@@ -13,7 +13,11 @@ October 2026). It runs under ORDS, mod_plsql or owart unchanged:
   (`DBDT_COLUMN` for dates) insert or update table `T` -- only a table listed in
   `DDG_WIKI_FORM_TABLES`;
 - page scripts (`{script}...{/script}`), owner locks, hiding a page from others' searches, and
-  email of a page.
+  email of a page;
+- **export**: `[Export]` downloads a page as a standalone HTML file (its styles, links back to
+  the wiki, no page scripts), and the Records page downloads a page's records as CSV -- a row per
+  record, a column per field, readable by a spreadsheet as UTF-8, with formula-like values kept
+  as text.
 
 Live at **/pro/owart/wiki/**. Sign in as `EDITOR` (the default), `READER` or `ADMIN` from the
 link on Home to see what each security level may do.
@@ -44,7 +48,7 @@ may do, what people are called, and sent mail. Here those are `wiki_env`, over a
 
 Replace the bodies; `web_wiki` itself does not change. Its entry points are `show_wiki`,
 `show_wiki_data`, `saveformdata`, `delete_wiki`, `rename_wiki`, `purge_wiki`, `email_form`,
-`email_wiki` and `wiki_js`; `set_batch_user` is for batch jobs and refuses a web request.
+`email_wiki`, `wiki_js`, `export_page` and `export_data`; `set_batch_user` is for batch jobs and refuses a web request.
 State-changing actions accept only a POST from the same site.
 
 The one other line to look at in `web_wiki.pkg` is `c_base`, the gateway path the wiki builds its

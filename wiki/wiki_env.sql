@@ -139,7 +139,8 @@ create or replace package body wiki_env is
     return l in ('web_wiki.show_wiki', 'web_wiki.show_wiki_data', '!web_wiki.saveformdata',
                  'web_wiki.saveformdata', 'web_wiki.delete_wiki', 'web_wiki.rename_wiki',
                  'web_wiki.purge_wiki', 'web_wiki.email_form', 'web_wiki.email_wiki',
-                 'web_wiki.wiki_js', 'wiki_env.sign_in', 'wiki_env.outbox');
+                 'web_wiki.wiki_js', 'web_wiki.export_page', 'web_wiki.export_data',
+                 'wiki_env.sign_in', 'wiki_env.outbox');
   end;
 
   procedure sign_in(p_user in varchar2 default null) is

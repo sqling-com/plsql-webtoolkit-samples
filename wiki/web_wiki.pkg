@@ -10,7 +10,7 @@ set define off
 --
 -- Gateway allow-list (ORDS: ords_admin / PlsqlRequestValidationFunction): expose only
 --   web_wiki.show_wiki, show_wiki_data, saveformdata, delete_wiki, rename_wiki,
---   purge_wiki, email_form, email_wiki, wiki_js  (wiki_env.allowed does it here)
+--   purge_wiki, email_form, email_wiki, wiki_js, export_page, export_data  (wiki_env.allowed does it here)
 -- set_batch_user refuses to run inside a web request, but it should not be listed either.
 ------------------------------------------------------------------------------
 create or replace package web_wiki is
@@ -76,6 +76,18 @@ create or replace package web_wiki is
   procedure wiki_js
     (v in varchar2 default null);
 
+  -- Download a document (p_topic's current revision, or revision p_id) as a
+  -- standalone HTML file: its own styles, links back to the wiki, no page scripts.
+  procedure export_page
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null);
+
+  -- Download the saved form records of a document (p_topic) or one revision (p_id)
+  -- as CSV: a row per record, a column per field.
+  procedure export_data
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null);
+
   -- For PL/SQL batch jobs that call saveformdata etc. outside a web request.
   -- Raises an error if called through the web gateway.
   procedure set_batch_user
@@ -114,6 +126,8 @@ create or replace package body web_wiki is
   c_email_url  constant varchar2(200) := c_base || 'web_wiki.email_wiki';
   c_save_url   constant varchar2(200) := c_base || '!web_wiki.saveformdata';
   c_js_url     constant varchar2(200) := c_base || 'web_wiki.wiki_js?v=20261017';
+  c_export_url constant varchar2(200) := c_base || 'web_wiki.export_page';
+  c_csv_url    constant varchar2(200) := c_base || 'web_wiki.export_data';
 
   c_app_title  constant varchar2(40)  := 'Wiki';
   c_home       constant varchar2(80)  := 'Home';
@@ -526,13 +540,19 @@ create or replace package body web_wiki is
     return l_out;
   end;
 
-  function render_content(p in clob) return clob is
+  -- p_prefix makes the [[links]] absolute; p_scripts false leaves {script} blocks out
+  -- (an exported page is a document, without the wiki's script to run them)
+  function render_content(p in clob, p_prefix in varchar2 default null,
+                          p_scripts in boolean default true) return clob is
     l clob;
   begin
     if p is null then
       return null;
     end if;
-    l := render_links(p);
+    l := render_links(p, p_prefix);
+    if not p_scripts then
+      l := regexp_replace(l, '\{script(\s[^}]*)?\}.*?\{/script\}', '', 1, 0, 'in');
+    end if;
     l := regexp_replace(l, '\{br\}', chr(13), 1, 0, 'i');
     l := regexp_replace(l, '\{underscore\}', '_', 1, 0, 'i');
     l := regexp_replace(l, '\{(/?)(script|style)(\s[^}]*)?\}', '<\1\2\3>', 1, 0, 'i');
@@ -699,6 +719,20 @@ create or replace package body web_wiki is
     end if;
   end;
 
+  -- headers for a file download; the name is made safe for Content-Disposition
+  procedure download_header(p_mime in varchar2, p_name in varchar2) is
+    l_name varchar2(200) := regexp_replace(substr(p_name, 1, 100), '[^A-Za-z0-9 ._-]', '_');
+  begin
+    if in_web then
+      owa_util.mime_header(p_mime, false, 'UTF-8');
+      htp.p('Content-Disposition: attachment; filename="' || l_name || '"');
+      htp.p('Cache-Control: no-store');
+      htp.p('X-Content-Type-Options: nosniff');
+      owa_util.http_header_close;
+    end if;
+    g_header_sent := true;
+  end;
+
   procedure redirect(p_url in varchar2) is
   begin
     if in_web then
@@ -818,6 +852,7 @@ create or replace package body web_wiki is
         nav(alink(c_emailf_url || '?p_topic=' || urlenc(g_pg.topic), '[Email]', 'Email this document',
                   'data-wiki="popup" target="wikipopup"'));
         nav('<a href="#" data-wiki="print" title="Print this document">[Print]</a>');
+        nav(alink(c_export_url || '?p_id=' || g_pg.id, '[Export]', 'Download this document as an HTML file'));
       end if;
       nav(alink(topic_href(c_help), '[Help]', 'Wiki help'));
     end if;
@@ -1623,7 +1658,9 @@ create or replace package body web_wiki is
          || '</td><td>' || fmt(r.created) || '</td><td>' || esc(safe_name(r.whocreated))
          || '</td><td>' || fmt(r.updated) || '</td><td>' || esc(safe_name(r.whoupdated)) || '</td></tr>');
     end loop;
-    htp.p('</table><p>' || case when l_n = 0 then 'No saved records.' else l_n || ' records.' end || '</p></main>');
+    htp.p('</table><p>' || case when l_n = 0 then 'No saved records.' else l_n || ' records. '
+       || alink(c_csv_url || case when l_id is not null then '?p_id=' || l_id else '?p_topic=' || urlenc(l_topic) end,
+                'Download as CSV', 'The records as a spreadsheet file') end || '</p></main>');
     footer;
     page_end;
   exception
@@ -1876,6 +1913,166 @@ create or replace package body web_wiki is
     when e_denied then undo; report('DENIED');
     when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
   end email_wiki;
+
+  procedure export_page
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null) is
+    l_id    number := num(p_id);
+    l_clob  clob;
+    l_found boolean := false;
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    if l_id is not null then
+      l_found := load_page(l_id, l_clob);
+    elsif p_topic is not null then
+      l_id := find_latest_id(p_topic);
+      if l_id is not null then
+        l_found := load_page(l_id, l_clob);
+      end if;
+    end if;
+    if not l_found then
+      fail('There is no document named "' || nvl(p_topic, p_id) || '".');
+    end if;
+
+    download_header('text/html', g_pg.topic || '.html');
+    htp.p('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">');
+    htp.p('<meta name="viewport" content="width=device-width, initial-scale=1">');
+    htp.p('<title>' || esc(g_pg.topic) || '</title>');
+    print_style;
+    htp.p('</head><body><main class="wiki-main">');
+    htp.p('<h1>' || esc(g_pg.topic) || '</h1>');
+    htp.p('<p class="wiki-upd">Exported from ' || alink(site_url || topic_href(g_pg.topic), c_app_title)
+       || ' on ' || to_char(sysdate, 'MM/DD/YYYY HH24:MI') || '; saved ' || fmt(g_pg.lastupdate)
+       || ' by ' || esc(safe_name(g_pg.lasteditor))
+       || case when g_pg.id <> g_pg.latest_id then ' (an older revision)' end || '.</p><hr>');
+    htp.prn('<div class="wiki-content">');
+    print_clob(render_content(l_clob, site_url, false));
+    htp.p('</div></main></body></html>');
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end export_page;
+
+  procedure export_data
+    (p_id    in varchar2 default null
+    ,p_topic in varchar2 default null) is
+    type t_names is table of varchar2(100)   index by pls_integer;
+    type t_pos   is table of pls_integer     index by varchar2(100);
+    type t_vals  is table of varchar2(32767) index by pls_integer;
+    c_eol   constant varchar2(2) := chr(13) || chr(10);
+    l_id    number := num(p_id);
+    l_topic varchar2(200);
+    l_names t_names;
+    l_pos   t_pos;
+    l_vals  t_vals;
+    l_k     pls_integer;
+    l_n     pls_integer := 0;
+
+    -- one CSV field: quoted when it has to be; a value a spreadsheet would run as
+    -- a formula (=, +, -, @ that is not a plain number) is written as text
+    function csv(p in varchar2) return varchar2 is
+      l varchar2(32767) := p;
+    begin
+      if l is null then
+        return null;
+      end if;
+      if regexp_like(l, '^[=+@-]') and not regexp_like(l, '^[+-]?[0-9][0-9.,]*$') then
+        l := '''' || l;
+      end if;
+      if instr(l, '"') > 0 or instr(l, ',') > 0 or instr(l, chr(10)) > 0 or instr(l, chr(13)) > 0
+         or l <> trim(l) then
+        l := '"' || replace(l, '"', '""') || '"';
+      end if;
+      return l;
+    end;
+
+    function stamp(d in date) return varchar2 is
+    begin
+      return to_char(d, 'YYYY-MM-DD HH24:MI');
+    end;
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    if l_id is not null then
+      begin
+        select topic into l_topic from ddg_wiki where id = l_id and deleted is null;
+      exception
+        when no_data_found then fail('That revision no longer exists.');
+      end;
+    else
+      l_topic := p_topic;
+    end if;
+    if latest_id_exact(l_topic) is null then
+      fail('There is no document named "' || l_topic || '".');
+    end if;
+
+    -- the columns: every field name used, in the order the fields were first saved
+    for r in (select min(d.fieldname) fieldname, min(d.pkid) first_pkid
+                from ddg_wiki_data d
+                join ddg_wiki w on w.id = d.wikiid
+               where (l_id is not null and w.id = l_id)
+                  or (l_id is null and w.topic = l_topic)
+               group by upper(d.fieldname)
+               order by 2)
+    loop
+      l_k := l_names.count + 1;
+      l_names(l_k) := r.fieldname;
+      l_pos(upper(r.fieldname)) := l_k;
+    end loop;
+
+    download_header('text/csv', l_topic || ' records.csv');
+    htp.prn(unistr('\FEFF'));                       -- so a spreadsheet reads the file as UTF-8
+    htp.prn('#,Created,Created by,Last changed,Changed by');
+    for k in 1 .. l_names.count loop
+      htp.prn(',' || csv(l_names(k)));
+    end loop;
+    htp.prn(c_eol);
+
+    for s in (select d.datasetid,
+                     min(d.dtcreated) created,
+                     max(d.whocreated) keep (dense_rank first order by d.dtcreated) whocreated,
+                     max(d.dtupdated) updated,
+                     max(d.whoupdated) keep (dense_rank last order by d.dtupdated) whoupdated
+                from ddg_wiki_data d
+                join ddg_wiki w on w.id = d.wikiid
+               where (l_id is not null and w.id = l_id)
+                  or (l_id is null and w.topic = l_topic)
+               group by d.datasetid
+               order by d.datasetid)
+    loop
+      l_n := l_n + 1;
+      l_vals.delete;
+      -- each value re-joined from its chunks; a field posted more than once
+      -- (a checkbox group) is one cell, its values separated by commas
+      for v in (select fieldname, valno, seq, fieldvalue
+                  from ddg_wiki_data
+                 where datasetid = s.datasetid
+                   and wikiid = (select max(x.wikiid) from ddg_wiki_data x where x.datasetid = s.datasetid)
+                 order by upper(fieldname), valno, seq)
+      loop
+        l_k := l_pos(upper(v.fieldname));
+        if not l_vals.exists(l_k) then
+          l_vals(l_k) := v.fieldvalue;
+        elsif nvl(length(l_vals(l_k)), 0) + nvl(length(v.fieldvalue), 0) < 32000 then
+          l_vals(l_k) := l_vals(l_k) || case when v.seq = 1 then ',' end || v.fieldvalue;
+        end if;
+      end loop;
+      htp.prn(l_n || ',' || stamp(s.created) || ',' || csv(safe_name(s.whocreated))
+           || ',' || stamp(s.updated) || ',' || csv(safe_name(s.whoupdated)));
+      for k in 1 .. l_names.count loop
+        htp.prn(',' || case when l_vals.exists(k) then csv(l_vals(k)) end);
+      end loop;
+      htp.prn(c_eol);
+    end loop;
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end export_data;
 
   procedure set_batch_user
     (p_user     in varchar2
