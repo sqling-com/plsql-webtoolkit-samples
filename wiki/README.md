@@ -22,7 +22,10 @@ October 2026). It runs under ORDS, mod_plsql or owart unchanged:
   wiki into another one -- the current pages, or every revision with the form records -- keeping
   editors, owners, locks and dates. Run it with SQL*Plus, SQLcl or SQL Developer in the other
   wiki's schema; a page that already exists there gets the loaded versions as new revisions, so
-  nothing is overwritten. It doubles as a backup.
+  nothing is overwritten. It doubles as a backup;
+- **the wiki as web pages** (administrators, from List of Documents): a `.zip` with a contents
+  page and a page per document, `[[links]]` between them, to read offline. Written in PL/SQL with
+  UTL_COMPRESS and UTL_RAW -- no Java, no files on the server.
 
 Live at **/pro/owart/wiki/**. Sign in as `EDITOR` (the default), `READER` or `ADMIN` from the
 link on Home to see what each security level may do.
@@ -53,7 +56,7 @@ may do, what people are called, and sent mail. Here those are `wiki_env`, over a
 
 Replace the bodies; `web_wiki` itself does not change. Its entry points are `show_wiki`,
 `show_wiki_data`, `saveformdata`, `delete_wiki`, `rename_wiki`, `purge_wiki`, `email_form`,
-`email_wiki`, `wiki_js`, `export_page`, `export_data` and `export_wiki`; `set_batch_user` is for batch jobs and refuses a web request.
+`email_wiki`, `wiki_js`, `export_page`, `export_data`, `export_wiki` and `export_site`; `set_batch_user` is for batch jobs and refuses a web request.
 State-changing actions accept only a POST from the same site.
 
 The one other line to look at in `web_wiki.pkg` is `c_base`, the gateway path the wiki builds its

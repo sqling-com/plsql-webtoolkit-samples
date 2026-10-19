@@ -10,7 +10,8 @@ set define off
 --
 -- Gateway allow-list (ORDS: ords_admin / PlsqlRequestValidationFunction): expose only
 --   web_wiki.show_wiki, show_wiki_data, saveformdata, delete_wiki, rename_wiki,
---   purge_wiki, email_form, email_wiki, wiki_js, export_page, export_data, export_wiki  (wiki_env.allowed does it here)
+--   purge_wiki, email_form, email_wiki, wiki_js, export_page, export_data, export_wiki,
+--   export_site  (wiki_env.allowed does it here)
 -- set_batch_user refuses to run inside a web request, but it should not be listed either.
 ------------------------------------------------------------------------------
 create or replace package web_wiki is
@@ -94,6 +95,10 @@ create or replace package web_wiki is
     (p_history in varchar2 default null
     ,p_records in varchar2 default null);
 
+  -- The whole wiki as web pages in a .zip, to read offline (administrators): a contents
+  -- page and a page per document, [[links]] between them, no page scripts.
+  procedure export_site;
+
   -- For PL/SQL batch jobs that call saveformdata etc. outside a web request.
   -- Raises an error if called through the web gateway.
   procedure set_batch_user
@@ -135,6 +140,7 @@ create or replace package body web_wiki is
   c_export_url constant varchar2(200) := c_base || 'web_wiki.export_page';
   c_csv_url    constant varchar2(200) := c_base || 'web_wiki.export_data';
   c_wiki_url   constant varchar2(200) := c_base || 'web_wiki.export_wiki';
+  c_site_url   constant varchar2(200) := c_base || 'web_wiki.export_site';
 
   c_app_title  constant varchar2(40)  := 'Wiki';
   c_home       constant varchar2(80)  := 'Home';
@@ -163,6 +169,7 @@ create or replace package body web_wiki is
     ,lt_exclude    varchar2(1)
     ,has_data      boolean);
 
+  type t_files is table of varchar2(200) index by varchar2(200);
   type t_col  is record (col varchar2(128), isdate boolean, val varchar2(32767));
   type t_cols is table of t_col index by pls_integer;
 
@@ -177,6 +184,7 @@ create or replace package body web_wiki is
   g_nav_count   pls_integer := 0;
   g_pg          t_pg;
   g_pg_empty    t_pg;               -- never assigned; used to clear g_pg
+  g_files       t_files;            -- export_site: upper(topic) -> file name in the .zip
 
   -- set by set_batch_user for non-web callers only
   g_batch_user  varchar2(30);
@@ -352,6 +360,7 @@ create or replace package body web_wiki is
     g_user := null;  g_level := -1;  g_my_home := null;  g_last_page := null;
     g_header_sent := false;  g_msg := null;  g_cfg := null;  g_nav_count := 0;
     g_pg := g_pg_empty;
+    g_files.delete;
 
     if in_web then
       begin
@@ -509,6 +518,14 @@ create or replace package body web_wiki is
              p, '&nbsp;', ' '), '&lt;', '<'), '&gt;', '>'), '&quot;', '"'), '&#39;', ''''), '&amp;', '&');
   end;
 
+  function link_target(p_topic in varchar2, p_prefix in varchar2) return varchar2 is
+  begin
+    if g_files.count > 0 and g_files.exists(upper(p_topic)) then
+      return utl_url.escape(g_files(upper(p_topic)), false, 'AL32UTF8');
+    end if;
+    return p_prefix || topic_href(p_topic);
+  end;
+
   -- [[Topic]] and [[Topic|label]] -> links. p_prefix makes them absolute (email).
   function render_links(p in clob, p_prefix in varchar2 default null) return clob is
     c_pat   constant varchar2(60) := '\[\[([^]|[]{1,200})(\|([^]]{1,400}))?\]\]';
@@ -537,7 +554,7 @@ create or replace package body web_wiki is
       l_label := regexp_substr(p, c_pat, l_pos, 1, null, 3);
       -- the link text is page HTML; the target is the plain document name
       l_topic := trim(html_decode(regexp_replace(l_raw, '<[^>]*>', '')));
-      app(l_out, '<a class="wikilink" href="' || esc(p_prefix || topic_href(l_topic)) || '">'
+      app(l_out, '<a class="wikilink" href="' || esc(link_target(l_topic, p_prefix)) || '">'
               || nvl(l_label, l_raw) || '</a>');
       l_pos := l_end;
     end loop;
@@ -582,9 +599,9 @@ create or replace package body web_wiki is
   end;
 
   ------------------------------------------------------------ page frame
-  procedure print_style is
+  function style_text return varchar2 is
   begin
-    htp.p(q'~<style>
+    return q'~<style>
   :root{--bar:#efefef;--line:#808080;--ink:#111;--muted:#666;--link:#1a4f8b}
   body{margin:0;font:10pt verdana,arial,helvetica,sans-serif;color:var(--ink);background:#fff}
   h1,h2,h3,h4,h5,h6,p,pre,ol,ul,form{margin-top:0;margin-bottom:0}
@@ -627,7 +644,12 @@ create or replace package body web_wiki is
   .wiki-panel{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;z-index:50}
   .wiki-panel>div{background:#fff;max-width:90vw;max-height:80vh;overflow:auto;padding:12px 16px;border-radius:4px}
   .wiki-email label{display:block;margin:8px 0} @media print{.wiki-bar,.wiki-foot{display:none}}
-</style>~');
+</style>~';
+  end;
+
+  procedure print_style is
+  begin
+    htp.p(style_text);
   end;
 
   ------------------------------------------------- page settings for wiki.js
@@ -1195,7 +1217,9 @@ create or replace package body web_wiki is
       htp.p('<p class="wiki-small">Export the wiki as a SQL script, to load into another wiki: '
          || alink(c_wiki_url, 'current pages', 'The current revision of every document')
          || ' &middot; ' || alink(c_wiki_url || '?p_history=Y&p_records=Y', 'everything',
-                                  'Every revision, and the form records') || '</p>');
+                                  'Every revision, and the form records')
+         || '. As web pages, to read offline: ' || alink(c_site_url, '.zip', 'A page per document, and a contents page')
+         || '</p>');
     end if;
     htp.p('</main>');
     footer;
@@ -2216,6 +2240,176 @@ create or replace package body web_wiki is
     when e_denied then undo; report('DENIED');
     when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
   end export_wiki;
+
+  procedure export_site is
+    l_zip   blob;
+    l_dir   blob;
+    l_page  blob;
+    l_count pls_integer := 0;
+    l_used  t_files;
+    l_name  varchar2(200);
+    l_wiki  varchar2(400) := site_url || c_url;
+    l_stamp varchar2(40) := to_char(sysdate, 'MM/DD/YYYY HH24:MI');
+    l_n     pls_integer := 0;
+
+    -- text onto a BLOB as UTF-8, in pieces a RAW can hold
+    procedure bapp(b in out nocopy blob, p in varchar2) is
+      r raw(32767);
+    begin
+      if p is not null then
+        r := utl_raw.cast_to_raw(p);
+        dbms_lob.writeappend(b, utl_raw.length(r), r);
+      end if;
+    end;
+
+    procedure bapp_clob(b in out nocopy blob, c in clob) is
+      l_len number := nvl(dbms_lob.getlength(c), 0);
+      l_off number := 1;
+    begin
+      while l_off <= l_len loop
+        bapp(b, dbms_lob.substr(c, 8000, l_off));
+        l_off := l_off + 8000;
+      end loop;
+    end;
+
+    function le4(n in number) return raw is
+    begin
+      return utl_raw.cast_from_binary_integer(n, utl_raw.little_endian);
+    end;
+
+    function le2(n in number) return raw is
+    begin
+      return utl_raw.substr(le4(n), 1, 2);
+    end;
+
+    -- One file into the .zip, the way as_zip does it: UTL_COMPRESS writes gzip --
+    -- 10 bytes of header, the deflate data, then CRC-32 and size -- and a zip
+    -- entry holds the same deflate data and CRC under its own header.
+    procedure zip_add(p_name in varchar2, p_content in blob) is
+      l_gz    blob := utl_compress.lz_compress(p_content);
+      l_len   number := dbms_lob.getlength(l_gz);
+      l_crc   raw(4) := dbms_lob.substr(l_gz, 4, l_len - 7);
+      l_size  number := nvl(dbms_lob.getlength(p_content), 0);
+      l_fname raw(1000) := utl_raw.cast_to_raw(p_name);
+      l_at    number := nvl(dbms_lob.getlength(l_zip), 0);
+      l_when  raw(4) := utl_raw.concat(
+                           le2(to_number(to_char(sysdate, 'HH24')) * 2048 + to_number(to_char(sysdate, 'MI')) * 32
+                               + trunc(to_number(to_char(sysdate, 'SS')) / 2)),
+                           le2((to_number(to_char(sysdate, 'YYYY')) - 1980) * 512
+                               + to_number(to_char(sysdate, 'MM')) * 32 + to_number(to_char(sysdate, 'DD'))));
+      l_head  raw(2000);
+    begin
+      -- local header: version 2.0, UTF-8 name (bit 11), deflate (8)
+      l_head := utl_raw.concat(hextoraw('504B0304'), hextoraw('1400'), hextoraw('0008'), hextoraw('0800'),
+                               l_when, l_crc, le4(l_len - 18), le4(l_size), le2(utl_raw.length(l_fname)),
+                               hextoraw('0000'), l_fname);
+      dbms_lob.writeappend(l_zip, utl_raw.length(l_head), l_head);
+      dbms_lob.copy(l_zip, l_gz, l_len - 18, dbms_lob.getlength(l_zip) + 1, 11);
+      -- its central directory entry
+      -- (made by / needed, flags / method; then extra, comment, disk, internal and
+      -- external attributes, all zero: 12 bytes. UTL_RAW.CONCAT takes 12 arguments at most.)
+      l_head := utl_raw.concat(hextoraw('504B0102'), hextoraw('14001400'), hextoraw('00080800'),
+                               l_when, l_crc, le4(l_len - 18), le4(l_size), le2(utl_raw.length(l_fname)),
+                               hextoraw('000000000000000000000000'), le4(l_at));
+      l_head := utl_raw.concat(l_head, l_fname);
+      dbms_lob.writeappend(l_dir, utl_raw.length(l_head), l_head);
+      l_count := l_count + 1;
+    end;
+
+    procedure page_head(b in out nocopy blob, p_title in varchar2) is
+    begin
+      bapp(b, '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+           || '<meta name="viewport" content="width=device-width, initial-scale=1">'
+           || '<title>' || esc(p_title) || '</title>' || chr(10));
+      bapp(b, style_text);
+      bapp(b, '</head><body>' || chr(10));
+    end;
+  begin
+    init_request;
+    savepoint web_wiki_sp;
+    check_view;
+    if not is_admin then
+      raise e_denied;
+    end if;
+    dbms_lob.createtemporary(l_zip, true, dbms_lob.call);
+    dbms_lob.createtemporary(l_dir, true, dbms_lob.call);
+
+    -- a file name per document: its name, made safe; unique ignoring case; never index.html
+    for t in (select topic, max(id) latest from ddg_wiki where deleted is null group by topic order by upper(topic)) loop
+      l_name := substr(regexp_replace(t.topic, '[^A-Za-z0-9 ._-]', '_'), 1, 150);
+      if l_used.exists(upper(l_name)) or upper(l_name) = 'INDEX' then
+        l_name := l_name || '-' || t.latest;
+      end if;
+      l_used(upper(l_name)) := t.topic;
+      g_files(upper(t.topic)) := l_name || '.html';
+    end loop;
+
+    -- the contents page
+    dbms_lob.createtemporary(l_page, true, dbms_lob.call);
+    page_head(l_page, c_app_title);
+    bapp(l_page, '<header class="wiki-bar"><div class="wiki-head"><h1>' || esc(c_app_title) || '</h1>'
+         || '<span class="wiki-upd">Exported ' || l_stamp || '</span></div><nav class="wiki-nav">'
+         || alink(l_wiki, 'Open the wiki') || '</nav></header><main class="wiki-main">'
+         || '<table class="wiki-grid"><tr><th>Document</th><th>Modified</th><th>Editor</th></tr>' || chr(10));
+    for r in (select w.topic, w.lastupdate, w.lasteditor
+                from ddg_wiki w
+               where w.id in (select max(id) from ddg_wiki where deleted is null group by topic)
+               order by upper(w.topic))
+    loop
+      l_n := l_n + 1;
+      bapp(l_page, '<tr><td>' || alink(utl_url.escape(g_files(upper(r.topic)), false, 'AL32UTF8'), r.topic)
+           || '</td><td>' || fmt(r.lastupdate)
+           || '</td><td>' || esc(safe_name(r.lasteditor)) || '</td></tr>' || chr(10));
+    end loop;
+    bapp(l_page, '</table><p>' || l_n || ' documents.</p></main><footer class="wiki-foot">Exported from '
+         || esc(l_wiki) || ' on ' || l_stamp || '.</footer></body></html>' || chr(10));
+    zip_add('index.html', l_page);
+
+    -- a page per document, its current revision
+    for r in (select w.topic, w.lastupdate, w.lasteditor, w.pageclob
+                from ddg_wiki w
+               where w.id in (select max(id) from ddg_wiki where deleted is null group by topic)
+               order by upper(w.topic))
+    loop
+      dbms_lob.createtemporary(l_page, true, dbms_lob.call);
+      page_head(l_page, r.topic);
+      bapp(l_page, '<header class="wiki-bar"><div class="wiki-head"><h1>' || esc(r.topic) || '</h1>'
+           || '<span class="wiki-upd">Last update: ' || fmt(r.lastupdate) || ' (' || esc(safe_name(r.lasteditor))
+           || ')</span></div><nav class="wiki-nav"><a href="index.html">Contents</a><span class="sep">|</span>'
+           || alink(site_url || topic_href(r.topic), 'In the wiki') || '</nav></header>'
+           || '<main class="wiki-main"><div class="wiki-content">' || chr(10));
+      bapp_clob(l_page, render_content(r.pageclob, site_url, false));
+      bapp(l_page, chr(10) || '</div></main><footer class="wiki-foot">Exported from ' || esc(l_wiki)
+           || ' on ' || l_stamp || '.</footer></body></html>' || chr(10));
+      zip_add(g_files(upper(r.topic)), l_page);
+    end loop;
+
+    -- the central directory, then its end record
+    declare
+      l_at  number := dbms_lob.getlength(l_zip);
+      l_end raw(100);
+    begin
+      dbms_lob.append(l_zip, l_dir);
+      l_end := utl_raw.concat(hextoraw('504B0506'), hextoraw('00000000'), le2(l_count), le2(l_count),
+                              le4(dbms_lob.getlength(l_dir)), le4(l_at), hextoraw('0000'));
+      dbms_lob.writeappend(l_zip, utl_raw.length(l_end), l_end);
+    end;
+    g_files.delete;
+
+    if in_web then
+      owa_util.mime_header('application/zip', false);
+      htp.p('Content-Disposition: attachment; filename="wiki-' || to_char(sysdate, 'YYYYMMDD') || '.zip"');
+      htp.p('Content-Length: ' || dbms_lob.getlength(l_zip));
+      htp.p('Cache-Control: no-store');
+      owa_util.http_header_close;
+      wpg_docload.download_file(l_zip);
+    end if;
+    g_header_sent := true;
+  exception
+    when e_user   then undo; report('USER');
+    when e_denied then undo; report('DENIED');
+    when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
+  end export_site;
 
   procedure set_batch_user
     (p_user     in varchar2
