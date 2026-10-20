@@ -11,7 +11,7 @@ set define off
 -- Gateway allow-list (ORDS: ords_admin / PlsqlRequestValidationFunction): expose only
 --   web_wiki.show_wiki, show_wiki_data, saveformdata, delete_wiki, rename_wiki,
 --   purge_wiki, email_form, email_wiki, wiki_js, export_page, export_data, export_wiki,
---   export_site  (wiki_env.allowed does it here)
+--   export_site, embed  (wiki_env.allowed does it here)
 -- set_batch_user refuses to run inside a web request, but it should not be listed either.
 ------------------------------------------------------------------------------
 create or replace package web_wiki is
@@ -99,6 +99,21 @@ create or replace package web_wiki is
   -- page and a page per document, [[links]] between them, no page scripts.
   procedure export_site;
 
+  -- A document's content alone -- its <div class="wiki-content">, no page around it:
+  -- for a page of the application's own to print in place (call it where the content
+  -- goes), or for a script to fetch and put into a page. Its [[links]] go to the wiki's
+  -- full pages; page scripts are left out (they need the wiki's own page to run).
+  -- Requested from a URL it sends its own header; called inside another page, only
+  -- the content. The current revision of p_topic, or revision p_id.
+  procedure embed
+    (p_topic in varchar2 default null
+    ,p_id    in varchar2 default null);
+
+  -- The same content as a value, for a page that places it itself.
+  function embed_html
+    (p_topic in varchar2 default null
+    ,p_id    in varchar2 default null) return clob;
+
   -- For PL/SQL batch jobs that call saveformdata etc. outside a web request.
   -- Raises an error if called through the web gateway.
   procedure set_batch_user
@@ -185,6 +200,7 @@ create or replace package body web_wiki is
   g_pg          t_pg;
   g_pg_empty    t_pg;               -- never assigned; used to clear g_pg
   g_files       t_files;            -- export_site: upper(topic) -> file name in the .zip
+  g_link_suffix varchar2(40);       -- added to [[links]]: &p_extralite=Y keeps an embedded page so
 
   -- set by set_batch_user for non-web callers only
   g_batch_user  varchar2(30);
@@ -361,6 +377,7 @@ create or replace package body web_wiki is
     g_header_sent := false;  g_msg := null;  g_cfg := null;  g_nav_count := 0;
     g_pg := g_pg_empty;
     g_files.delete;
+    g_link_suffix := null;
 
     if in_web then
       begin
@@ -523,7 +540,7 @@ create or replace package body web_wiki is
     if g_files.count > 0 and g_files.exists(upper(p_topic)) then
       return utl_url.escape(g_files(upper(p_topic)), false, 'AL32UTF8');
     end if;
-    return p_prefix || topic_href(p_topic);
+    return p_prefix || topic_href(p_topic) || g_link_suffix;
   end;
 
   -- [[Topic]] and [[Topic|label]] -> links. p_prefix makes them absolute (email).
@@ -907,6 +924,9 @@ create or replace package body web_wiki is
     l_extra  boolean := nvl(upper(p_extralite), 'N') = 'Y';
     l_title  varchar2(1000);
   begin
+    if l_extra then
+      g_link_suffix := '&p_extralite=Y';   -- a link in an embedded page opens embedded too
+    end if;
     if l_topic is null and l_id is null then
       l_topic := c_home;
     end if;
@@ -2410,6 +2430,52 @@ create or replace package body web_wiki is
     when e_denied then undo; report('DENIED');
     when others   then undo; report('OTHER', sqlerrm, dbms_utility.format_error_backtrace);
   end export_site;
+
+  function embed_html
+    (p_topic in varchar2 default null
+    ,p_id    in varchar2 default null) return clob is
+    l_id    number := num(p_id);
+    l_clob  clob;
+    l_found boolean := false;
+    l_out   clob;
+  begin
+    init_request;
+    if nvl(g_level, -1) < 1 then
+      return '<div class="wiki-content wiki-missing">You do not have permission to read this.</div>';
+    end if;
+    if l_id is not null then
+      l_found := load_page(l_id, l_clob);
+    else
+      l_id := find_latest_id(nvl(trim(p_topic), c_home));
+      if l_id is not null then
+        l_found := load_page(l_id, l_clob);
+      end if;
+    end if;
+    if not l_found then
+      return '<div class="wiki-content wiki-missing">There is no document named '
+          || esc(nvl(p_topic, p_id)) || '.</div>';
+    end if;
+    dbms_lob.createtemporary(l_out, true, dbms_lob.call);
+    app(l_out, '<div class="wiki-content" data-topic="' || esc(g_pg.topic) || '">');
+    dbms_lob.append(l_out, render_content(l_clob, site_url, false));
+    app(l_out, '</div>');
+    return l_out;
+  end embed_html;
+
+  procedure embed
+    (p_topic in varchar2 default null
+    ,p_id    in varchar2 default null) is
+    l_html clob := embed_html(p_topic, p_id);
+  begin
+    -- asked for by a URL: this is the whole response, so it has a header of its own
+    if in_web and lower(owa_util.get_procedure) like '%web_wiki.embed' then
+      owa_util.mime_header('text/html', false, 'UTF-8');
+      htp.p('Cache-Control: no-store');
+      htp.p('X-Content-Type-Options: nosniff');
+      owa_util.http_header_close;
+    end if;
+    print_clob(l_html);
+  end embed;
 
   procedure set_batch_user
     (p_user     in varchar2

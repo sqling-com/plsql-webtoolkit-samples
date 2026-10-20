@@ -140,7 +140,7 @@ create or replace package body wiki_env is
                  'web_wiki.saveformdata', 'web_wiki.delete_wiki', 'web_wiki.rename_wiki',
                  'web_wiki.purge_wiki', 'web_wiki.email_form', 'web_wiki.email_wiki',
                  'web_wiki.wiki_js', 'web_wiki.export_page', 'web_wiki.export_data', 'web_wiki.export_wiki',
-                 'web_wiki.export_site',
+                 'web_wiki.export_site', 'web_wiki.embed',
                  'wiki_env.sign_in', 'wiki_env.outbox');
   end;
 
