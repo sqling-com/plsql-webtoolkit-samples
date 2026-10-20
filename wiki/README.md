@@ -27,8 +27,9 @@ October 2026). It runs under ORDS, mod_plsql or owart unchanged:
   page and a page per document, `[[links]]` between them, to read offline. Written in PL/SQL with
   UTL_COMPRESS and UTL_RAW -- no Java, no files on the server.
 
-Live at **/pro/owart/wiki/**. Sign in as `EDITOR` (the default), `READER` or `ADMIN` from the
-link on Home to see what each security level may do.
+Live, read-only, at **sqling.com/web-toolkit/demo/wiki/**; the copy that can be edited -- sign
+in as `EDITOR` (the default), `READER` or `ADMIN` from the link on Home to see what each security
+level may do -- is in Pro, at /pro/owart/wiki/.
 
 ## Files, in install order
 
@@ -38,6 +39,7 @@ link on Home to see what each security level may do.
 | `wiki_env.sql` | what the wiki needs from the application around it (below) |
 | `web_wiki.pkg` | the engine: package `web_wiki` |
 | `pages.sql` | starter pages showing links, page forms, a database form, a page script and a lock |
+| `read_only.sql` | optional, last: a copy anyone may read and no one may change (with `wiki_read_only` as the DAD's request validation function) -- how sqling.com serves its public one |
 
 ## The application around it
 
