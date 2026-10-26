@@ -153,6 +153,12 @@ BEGIN
   nw_doc('NW_MAIN', 'MENU.PB_SUPPLIERS', 'Open the Suppliers form.');
   nw_doc('NW_MAIN', 'MENU.PB_EMPLOYEES', 'Open the Employees form.');
   nw_doc('NW_MAIN', 'MENU.PB_LOOKUPS', 'Open the Lookups form: categories, shippers, regions and territories.');
+  nw_doc('NW_MAIN', 'MENU.PB_RPT_CUSTOMERS_BY_COUNTRY',
+         'Run the Customers by Country report: every customer grouped by country, with a count.');
+  nw_doc('NW_MAIN', 'MENU.PB_RPT_ORDERS_BY_CUSTOMER',
+         'Run the Orders by Customer report. It asks which customer, and lists that customer''s orders.');
+  nw_doc('NW_MAIN', 'MENU.PB_RPT_PRODUCT_CATALOG',
+         'Run the Product Catalog report: products by category, with their prices and stock.');
   nw_doc('NW_MAIN', 'MENU.PB_EXIT', 'Leave the application.');
 
   -- NW_CUSTOMERS
@@ -166,6 +172,8 @@ BEGIN
   nw_doc('NW_CUSTOMERS', 'ORDERS.SHIPNAME', 'Who the order was shipped to.');
   nw_doc('NW_CUSTOMERS', 'ORDERS.SHIPCITY', 'City the order was shipped to.');
   nw_doc('NW_CUSTOMERS', 'ORDERS.SHIPCOUNTRY', 'Country the order was shipped to.');
+  nw_doc('NW_CUSTOMERS', 'TOOLBAR.PB_RPT_ORDERS_BY_CUSTOMER',
+         'Run the Orders by Customer report for the customer on screen, in a new window.');
 
   -- NW_ORDERS
   nw_doc('NW_ORDERS', 'ORDERS.ORDERID', 'The order''s number, assigned when a new order is saved (one more than the highest so far).');
@@ -190,6 +198,8 @@ BEGIN
   nw_doc('NW_ORDERS', 'TOOLBAR.PB_CUSTOMER_LOV', 'Choose the customer from a list.');
   nw_doc('NW_ORDERS', 'TOOLBAR.PB_EMPLOYEE_LOV', 'Choose the employee from a list.');
   nw_doc('NW_ORDERS', 'TOOLBAR.PB_PRODUCT_LOV', 'Choose the current line''s product from a list.');
+  nw_doc('NW_ORDERS', 'TOOLBAR.PB_RPT_ORDERS_BY_CUSTOMER',
+         'Run the Orders by Customer report for the order''s customer, in a new window.');
   nw_doc('NW_ORDERS', 'TOOLBAR.PB_NEW_LINE', 'Add a line to the order.');
   nw_doc('NW_ORDERS', 'TOOLBAR.PB_DELETE_LINE', 'Remove the current line from the order (when you save).');
 
@@ -206,6 +216,8 @@ BEGIN
   nw_doc('NW_PRODUCTS', 'PRODUCTS.REORDERLEVEL', 'Stock level at which more should be ordered.');
   nw_doc('NW_PRODUCTS', 'PRODUCTS.DISCONTINUED', 'Ticked when the product is no longer sold.');
   nw_doc('NW_PRODUCTS', 'TOOLBAR.PB_SUPPLIER_LOV', 'Choose the supplier from a list.');
+  nw_doc('NW_PRODUCTS', 'TOOLBAR.PB_RPT_PRODUCT_CATALOG',
+         'Run the Product Catalog report, in a new window.');
 
   -- NW_SUPPLIERS
   nw_doc('NW_SUPPLIERS', 'SUPPLIERS.SUPPLIERID', 'The supplier''s number, assigned when a new supplier is saved.');
