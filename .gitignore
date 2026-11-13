@@ -1,0 +1,11 @@
+# This repository is public, and only the PL/SQL samples written for the
+# demos belong in it (bin/publish-samples copies those by name and commits
+# whatever else is lying about). No Oracle Forms module is ours to publish
+# from here, so none can be committed by accident.
+*.fmb
+*.mmb
+*.pll
+*.rdf
+*.inp
+forms-book/
+carewell*
